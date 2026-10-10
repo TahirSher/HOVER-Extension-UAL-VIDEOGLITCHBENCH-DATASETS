@@ -104,6 +104,31 @@ The work directory defaults to crux_v8_work so that the windows and the generic
 detector calls cached by v8/v9 are reused (identical prompts); v10 writes its
 calibrations, runs and evaluations under a separate 'v10' sub-tree.
 
+UAL-Bench extension (dataset-isolated; every command above is unchanged)
+------------------------------------------------------------------------
+UAL-Bench (Abdullah et al., WACV 2025; https://github.com/Hasnat79/UAL_Bench):
+UAG-OOPS, UAG-SSBD and UAG-FunQA, one query and one GT interval per item,
+scored by the official R@1 IoU / R@1 TD / mTD evaluator (ported exactly).
+Mode A, the primary and only implemented UAL mode, is a query-conditioned
+evaluation of the CRUX LOCALISATION CORE: the official query is the
+hypothesis, V and S run unchanged with a fixed rule (tau = 0, lambda = inf,
+i.e. one interval; frame refinement), H and U are not used. It is not an
+evaluation of the full open-ended H -> V -> S -> U pipeline.
+Only Qwen2.5-VL-7B-Instruct, InternVL2.5-8B and UI-TARS-1.5-7B are allowed.
+
+  python crux_v10.py selftest_ual [--ual_repo /path/UAL_Bench]
+  python crux_v10.py inspect_ual  --ual_root /path/UAL_Bench --ual_dataset all
+  python crux_v10.py run_ual      --ual_root /path/UAL_Bench --ual_dataset uag_oops \\
+                                  --backbone qwen2.5-vl-7b --limit 1          # smoke test
+  python crux_v10.py run_ual      --ual_root /path/UAL_Bench --ual_dataset all --backbone all \\
+      --ual_api_bases qwen2.5-vl-7b=http://localhost:8000/v1,internvl2.5-8b=http://localhost:8002/v1,ui-tars-1.5-7b=http://localhost:8003/v1
+  python crux_v10.py evaluate_ual --ual_root /path/UAL_Bench --ual_dataset all --backbone all
+  python crux_v10.py evaluate_ual --ual_predictions predictions_official.json [--ual_repo ...]
+
+Outputs go to <parent of --ual_root>/crux_v10_ual_work/ual_bench/ (or
+--ual_work_root), never into the VideoGlitchBench root, crux_v8_work, the GliDe
+repository or the UAL-Bench data. See the UAL-Bench section near the end.
+
 Portions (evaluation prompt, summariser prompt, preprocessing geometry,
 evaluator logic) follow the GliDe repository, MIT licence, (c) its authors.
 """
@@ -3429,11 +3454,1956 @@ def selftest(glide_repo: str = "", verbose: bool = True) -> None:
 
 
 # =============================================================================
+# UAL-Bench: query-conditioned CRUX localisation core (Mode A)
+#
+# Everything in this block is new and dataset-isolated. No function above it
+# was modified: VideoGlitchBench commands, paths, caches, calibrations and runs
+# are untouched (enforced by ual_resolve_work_root and tested in selftest_ual).
+#
+# Official protocol, verified in https://github.com/Hasnat79/UAL_Bench:
+#   annotations  data/uag_oops/oops_uag_paper_version.json
+#                  dict {video_id: {start_time, end_time, description}}   1589 items
+#                data/uag_ssbd/ssbd_paper_version.json
+#                  list [[video_tag, {id, time 'MMSS:MMSS', category, intensity, ...}]]
+#                  104 items over 58 videos (up to 7 behaviours per video)
+#                data/uag_funqa/uag_funqa_dataset.json
+#                  list [{instruction, visual_input, ID, start_time, end_time, output, task}]  172 items
+#   item ids     src/data_loaders/ssbd_loader.py: video_tag + '_' + behaviour id; OOPS: dict key;
+#                FunQA: visual_input (the key of the official prediction files)
+#   query text   src/llama3_x_*_uag_oops.py: description;  *_ssbd.py:
+#                f"A person is {category} with {intensity} intensity.";  *_funqa.py: instruction
+#   evaluator    src/eval/eval_your_results.py (ported exactly in ual_official_metrics)
+#   predictions  src/eval/output_test_template.json:
+#                  [{video_id, start_time, end_time, pred_start, pred_end}, ...]
+#
+# Mode A (the primary and only implemented UAL mode). The official query is the
+# CRUX hypothesis; H (open description, event resolution, summary) is skipped
+# because the query is given, and U (utility selection) is bypassed because
+# every item needs exactly one interval and the VideoGlitchBench-fitted model is
+# not valid here. What runs is CRUX V -> S plus its frame refinement:
+#   V  s_q(w) = logit P(Yes | w, q) - logit P(Yes | grey, q)       (verify_profile)
+#   S  argmax over single segments of sum_t (s_q(t) - tau): segment_profile with
+#      lambda = 1e9, i.e. the K = 1 case of the CRUX segmentation (Kadane)
+#   G  boundary windows refined to frames by masked-frame bisection with a
+#      presence oracle at margin tau (frame_onset / frame_offset, unchanged)
+# UAL-Bench publishes no train/dev split for the three evaluation sets, so
+# nothing is calibrated: tau = 0 (the zero point of contextual calibration),
+# lambda = infinity (one interval per item, as the official protocol scores)
+# and refine = frame are fixed before any UAL result is seen.
+# The only task adapter is the presence prompt (P_UAL_PRESENCE_SYS /
+# ual_presence_user): the VideoGlitchBench prompt names games and glitches.
+# =============================================================================
+
+UAL_ADAPTER_VERSION = "ual-modeA-1.0"
+UAL_PROMPT_VERSION = "ual-presence-1"
+UAL_SUBSETS: Tuple[str, ...] = ("uag_oops", "uag_ssbd", "uag_funqa")
+UAL_DISPLAY = {"uag_oops": "UAG-OOPS", "uag_ssbd": "UAG-SSBD", "uag_funqa": "UAG-FunQA"}
+UAL_ANNOTATION_FILES = {"uag_oops": "oops_uag_paper_version.json",
+                        "uag_ssbd": "ssbd_paper_version.json",
+                        "uag_funqa": "uag_funqa_dataset.json"}
+# The only backbones of the UAL-Bench experiment: key -> (display name, HF id).
+UAL_BACKBONES: Dict[str, Tuple[str, str]] = {
+    "qwen2.5-vl-7b": ("Qwen2.5-VL-7B-Instruct", "Qwen/Qwen2.5-VL-7B-Instruct"),
+    "internvl2.5-8b": ("InternVL2.5-8B", "OpenGVLab/InternVL2_5-8B"),
+    "ui-tars-1.5-7b": ("UI-TARS-1.5-7B", "ByteDance-Seed/UI-TARS-1.5-7B")}
+# OOPS-UAG-Instruct is training data. The Drive folder names it *_v1.json, the
+# official repository data/uag_oops_train_instruct/uag_oops_train_instruct_dataset.json.
+UAL_TRAINING_FILES = ("uag_oops_train_instruct_dataset_v1.json",
+                      "uag_oops_train_instruct_dataset.json")
+UAL_TRAINING_DIRS = ("uag_oops_instruct", "uag_oops_train_instruct")
+UAL_MODES = ("query_conditioned", "open_ended_full_pipeline")
+UAL_REFINE_MODES = ("frame", "window")
+UAL_IOU_THRESHOLDS = (0.3, 0.5, 0.7)          # eval_recall_1_iou
+UAL_TD_THRESHOLDS = (0, 1, 3, 5, 7)           # abs_dist
+UAL_OFFICIAL_KEYS = ("video_id", "start_time", "end_time", "pred_start", "pred_end")
+UAL_MAIN_HEADER = ("Model | R@1,0.3 | R@1,0.5 | R@1,0.7 | R@1,TD≤0 | R@1,TD≤1 | R@1,TD≤3 | "
+                   "R@1,TD≤5 | mTD")
+UAL_COMMANDS = ("inspect_ual", "run_ual", "evaluate_ual", "selftest_ual")
+UAL_PREDECLARED = {"seg_tau": 0.0, "seg_penalty": 1e9, "refine_mode": "frame"}
+
+MODE_B_MESSAGE = (
+    "Mode B (--ual_mode open_ended_full_pipeline) is intentionally not implemented. CRUX's H "
+    "stage (P_DESC_OPEN_SYS, P_EAR_SYS, the GliDe summariser) asks for video-game glitches and "
+    "its U selector was fitted on VideoGlitchBench judge ratings; running them on UAL-Bench "
+    "needs new prompts and a new selector, i.e. a different method, plus a validated rule for "
+    "matching generated hypotheses to the query. Use the default --ual_mode query_conditioned "
+    "(Mode A).")
+
+# P_PRESENCE_SYS with the domain changed from 'game glitch' to 'event', plus the
+# frame-layout sentence of P_DETECT_SYS. One prompt for all three subsets, fixed
+# before any UAL-Bench result was computed.
+P_UAL_PRESENCE_SYS = (
+    "You are a video analyst. You are given one stitched window of consecutive video frames, "
+    "each labelled '#<frame index>' in temporal order (left to right, top row then bottom "
+    "row), and a query about one specific event. Decide whether that event is visibly "
+    "occurring in this window. Being plausible is not enough; it must be observable.")
+
+
+def ual_presence_user(query: str) -> str:
+    """The query is inserted verbatim. Nothing else about the item (and never a
+    timestamp) reaches the model."""
+    return (f"Query: {query}\nIs the event described or requested by this query visibly "
+            f"occurring in this window? Answer with exactly one word: Yes or No.")
+
+
+# -----------------------------------------------------------------------------
+# Records: the model-visible part and the evaluator-only part are separate types
+# -----------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class UALQuery:
+    """Model-visible part of one evaluation item. It has no timestamp fields on
+    purpose: ground truth lives in UALGroundTruth and only the evaluator joins it."""
+    subset: str
+    item_id: str           # official evaluation key ('video_id' in the prediction schema)
+    video_id: str          # video file stem (several SSBD items share one video)
+    video_file: str
+    query: str
+    meta: Tuple[Tuple[str, str], ...] = ()   # official non-temporal fields, audit only
+
+
+@dataclass(frozen=True)
+class UALGroundTruth:
+    item_id: str
+    start_time: float
+    end_time: float
+    source: str            # verbatim source of the timestamps
+
+
+@dataclass
+class UALDataset:
+    subset: str
+    annotation_path: str
+    annotation_sha256: str     # depends on GT: metadata only, never in a cache key
+    inputs_fingerprint: str    # GT-free: (item_id, video_file, query) of every item
+    queries: List[UALQuery]
+    gt: Dict[str, UALGroundTruth]
+    video_paths: Dict[str, Optional[str]]
+    video_dirs: List[str]
+
+
+@dataclass
+class UALSettings:
+    subsets: Tuple[str, ...] = ()
+    root: str = ""
+    annotations: str = ""
+    video_root: str = ""
+    subset_annotations: Dict[str, str] = field(default_factory=dict)
+    subset_videos: Dict[str, str] = field(default_factory=dict)
+    work_root: str = ""
+    mode: str = "query_conditioned"
+    seg_tau: float = 0.0
+    seg_penalty: float = 1e9
+    refine_mode: str = "frame"
+    ssbd_time_format: str = "mmss"
+    allow_missing_videos: bool = False
+    api_bases: Dict[str, str] = field(default_factory=dict)
+    limit: Optional[int] = None
+    official_repo: str = ""
+
+    @property
+    def partial(self) -> bool:
+        return bool(self.limit)
+
+    @property
+    def run_tag(self) -> str:
+        return f"partial_limit{self.limit}" if self.limit else "full"
+
+    def predeclared(self) -> bool:
+        return (self.seg_tau, self.seg_penalty, self.refine_mode) == (
+            UAL_PREDECLARED["seg_tau"], UAL_PREDECLARED["seg_penalty"], UAL_PREDECLARED["refine_mode"])
+
+
+def _ual_short(subset: str) -> str:
+    return subset[len("uag_"):]
+
+
+def _ual_num(x: Any, what: str) -> float:
+    require(isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(float(x)),
+            f"{what}: expected a finite number, got {x!r}")
+    return float(x)
+
+
+def ual_parse_ssbd_time(t: Any, fmt: str) -> Tuple[float, float]:
+    """SSBD 'time' -> (start, end) seconds. The paper-version file stores
+    'MMSS:MMSS' (e.g. '0105:0125' = 65 s to 85 s): among the 104 records no
+    seconds field reaches 60 although 38 have a field >= 0100, which is
+    incompatible with plain seconds. data/README.md calls the values 'seconds'
+    and the repository contains no conversion code, so the format is a flag
+    (inspect_ual checks both readings against the decoded video durations)."""
+    m = re.fullmatch(r"\s*(\d+):(\d+)\s*", str(t))
+    require(m is not None, f"SSBD time {t!r} is not of the form 'dddd:dddd'")
+    a, b = m.group(1), m.group(2)
+    if fmt == "seconds":
+        return float(int(a)), float(int(b))
+    require(fmt == "mmss", f"unknown --ual_ssbd_time_format {fmt!r}")
+
+    def mmss(x: str) -> float:
+        require(len(x) >= 3, f"SSBD time field {x!r} is too short for MMSS")
+        mm, ss = int(x[:-2]), int(x[-2:])
+        require(ss < 60, f"SSBD time field {x!r} has seconds {ss} >= 60, so it is not MMSS; "
+                         f"pass --ual_ssbd_time_format seconds if the file stores seconds")
+        return float(60 * mm + ss)
+    return mmss(a), mmss(b)
+
+
+def ual_reject_training_file(path: str) -> None:
+    """OOPS-UAG-Instruct is instruction-tuning data, never benchmark input."""
+    ap = os.path.abspath(path)
+    parts = set(os.path.normpath(ap).split(os.sep))
+    base = os.path.basename(ap)
+    if base in UAL_TRAINING_FILES or "train_instruct" in base or parts & set(UAL_TRAINING_DIRS):
+        raise RuntimeError(
+            f"rejected UAL-Bench annotation file {ap}: it is OOPS-UAG-Instruct "
+            f"training/instruction-format data, not evaluation data. For UAG-OOPS evaluation use "
+            f"oops_uag_paper_version.json (official path data/uag_oops/oops_uag_paper_version.json).")
+
+
+def ual_annotation_candidates(root: str, subset: str) -> List[str]:
+    """Official repository layout first, then the Drive folder layouts."""
+    f = UAL_ANNOTATION_FILES[subset]
+    return [os.path.join(root, "data", subset, f), os.path.join(root, subset, f),
+            os.path.join(root, f)]
+
+
+def ual_find_annotation(us: UALSettings, subset: str) -> str:
+    explicit = us.subset_annotations.get(subset) or us.annotations
+    if explicit:
+        ual_reject_training_file(explicit)
+        require(os.path.isfile(explicit), f"{UAL_DISPLAY[subset]} annotation file not found: "
+                                          f"{explicit}")
+        return os.path.abspath(explicit)
+    require(bool(us.root), f"no annotation path for {UAL_DISPLAY[subset]}: pass --ual_root (the "
+                           f"UAL-Bench repository or dataset folder) or "
+                           f"--ual_{_ual_short(subset)}_annotations. VideoGlitchBench is never "
+                           f"used as a fallback.")
+    cands = ual_annotation_candidates(us.root, subset)
+    hit = next((c for c in cands if os.path.isfile(c)), None)
+    require(hit is not None,
+            f"{UAL_DISPLAY[subset]} evaluation annotations ({UAL_ANNOTATION_FILES[subset]}) not "
+            f"found; looked in {cands}. Copy the file from the official repository "
+            f"(data/{subset}/{UAL_ANNOTATION_FILES[subset]}) or the corrected Drive folder, or pass "
+            f"--ual_{_ual_short(subset)}_annotations. VideoGlitchBench is never used as a fallback.")
+    ual_reject_training_file(hit)
+    return os.path.abspath(hit)
+
+
+def ual_parse_annotations(subset: str, data: Any, path: str, ssbd_time_format: str = "mmss"
+                          ) -> Tuple[List[UALQuery], Dict[str, UALGroundTruth]]:
+    """Schema-checked parser of the three paper-version files. Timestamps are
+    stored verbatim (SSBD: converted from its 'time' string only); nothing is
+    clipped, shortened or repaired. Malformed records abort the load."""
+    if (isinstance(data, list) and data and isinstance(data[0], dict)
+            and "QA" in data[0] and "video" in data[0]):
+        ual_reject_training_file(os.path.join(os.path.dirname(path), UAL_TRAINING_FILES[0]))
+    qs: List[UALQuery] = []
+    gts: Dict[str, UALGroundTruth] = {}
+
+    def schema(expected: str) -> str:
+        return (f"{path} does not have the {UAL_DISPLAY[subset]} paper-version schema (expected "
+                f"{expected}, got {type(data).__name__}); is it the file of another subset?")
+    if subset == "uag_oops":
+        require(isinstance(data, dict), schema("a JSON object {video_id: {start_time, end_time, "
+                                               "description}}"))
+        for k, v in data.items():
+            require(isinstance(v, dict) and {"start_time", "end_time", "description"} <= set(v),
+                    f"{path}: record {k!r} lacks start_time/end_time/description")
+            iid = str(k)
+            qs.append(UALQuery(subset, iid, iid, iid + ".mp4", str(v["description"])))
+            gts[iid] = UALGroundTruth(iid, _ual_num(v["start_time"], f"{iid}.start_time"),
+                                      _ual_num(v["end_time"], f"{iid}.end_time"),
+                                      json.dumps([v["start_time"], v["end_time"]]))
+    elif subset == "uag_ssbd":
+        require(isinstance(data, list), schema("a JSON list [[video_tag, behaviour], ...]"))
+        for n, e in enumerate(data):
+            require(isinstance(e, (list, tuple)) and len(e) == 2 and isinstance(e[0], str)
+                    and isinstance(e[1], dict), f"{path}: entry {n} is not [video_tag, behaviour]")
+            tag, b = e
+            require({"id", "time", "category", "intensity"} <= set(b),
+                    f"{path}: entry {n} ({tag}) lacks id/time/category/intensity")
+            iid = f"{tag}_{b['id']}"          # Ssbd_DataLoader.__iter__
+            query = f"A person is {b['category']} with {b['intensity']} intensity."
+            s, t = ual_parse_ssbd_time(b["time"], ssbd_time_format)
+            meta = tuple((k, str(b[k])) for k in ("id", "category", "intensity", "bodypart",
+                                                  "modality", "description") if k in b)
+            qs.append(UALQuery(subset, iid, tag, tag + ".mp4", query, meta))
+            gts[iid] = UALGroundTruth(iid, s, t, str(b["time"]))
+    elif subset == "uag_funqa":
+        require(isinstance(data, list) and all(isinstance(r, dict) for r in data),
+                schema("a JSON list of {instruction, visual_input, start_time, end_time, ...}"))
+        for n, r in enumerate(data):
+            require({"instruction", "visual_input", "start_time", "end_time"} <= set(r),
+                    f"{path}: entry {n} lacks instruction/visual_input/start_time/end_time")
+            iid = str(r["visual_input"])
+            vf = iid if iid.lower().endswith(".mp4") else iid + ".mp4"
+            meta = tuple((k, str(r[k])) for k in ("ID", "task") if k in r)
+            qs.append(UALQuery(subset, iid, os.path.splitext(vf)[0], vf, str(r["instruction"]),
+                               meta))
+            gts[iid] = UALGroundTruth(iid, _ual_num(r["start_time"], f"{iid}.start_time"),
+                                      _ual_num(r["end_time"], f"{iid}.end_time"),
+                                      json.dumps({"start_time": r["start_time"],
+                                                  "end_time": r["end_time"],
+                                                  "output": r.get("output")}))
+    else:
+        raise ValueError(f"unknown UAL-Bench subset {subset}")
+    ids = [q.item_id for q in qs]
+    dup = sorted({i for i in ids if ids.count(i) > 1}) if len(set(ids)) != len(ids) else []
+    require(not dup, f"{path}: duplicate evaluation ids {dup[:5]}")
+    bad = [i for i, g in gts.items() if g.start_time < 0 or g.end_time < g.start_time]
+    require(not bad, f"{path}: {len(bad)} records with negative or reversed GT intervals, e.g. "
+                     f"{bad[:5]}; refusing to repair ground truth")
+    require(qs, f"{path}: no evaluation items")
+    return qs, gts
+
+
+def ual_video_dirs(us: UALSettings, subset: str) -> List[str]:
+    if us.subset_videos.get(subset):
+        return [os.path.abspath(us.subset_videos[subset])]
+    out: List[str] = []
+    for r in ([us.video_root] if us.video_root else []) + ([us.root] if us.root else []):
+        out += [os.path.join(r, "data", subset, "videos"), os.path.join(r, subset, "videos"),
+                os.path.join(r, subset)]
+    if us.video_root and len(us.subsets) == 1:
+        out.append(us.video_root)
+    return list(dict.fromkeys(os.path.abspath(d) for d in out))
+
+
+def ual_inputs_fingerprint(queries: Sequence[UALQuery]) -> str:
+    blob = json.dumps([[q.item_id, q.video_file, q.query] for q in queries])
+    return hashlib.sha256(blob.encode()).hexdigest()[:16]
+
+
+def ual_load_dataset(us: UALSettings, subset: str) -> UALDataset:
+    path = ual_find_annotation(us, subset)
+    with open(path, "rb") as f:
+        raw = f.read()
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as e:
+        raise RuntimeError(f"{path} is not valid JSON ({e})")
+    qs, gts = ual_parse_annotations(subset, data, path, us.ssbd_time_format)
+    dirs = ual_video_dirs(us, subset)
+    vp: Dict[str, Optional[str]] = {}
+    for q in qs:
+        if q.video_file not in vp:
+            vp[q.video_file] = next((os.path.join(d, q.video_file) for d in dirs
+                                     if os.path.isfile(os.path.join(d, q.video_file))), None)
+    return UALDataset(subset, path, hashlib.sha256(raw).hexdigest(), ual_inputs_fingerprint(qs),
+                      qs, gts, vp, dirs)
+
+
+def ual_select_items(ds: UALDataset, limit: Optional[int]) -> List[UALQuery]:
+    """The first `limit` items in official annotation order (deterministic)."""
+    return list(ds.queries[:limit]) if limit else list(ds.queries)
+
+
+def ual_check_media(ds: UALDataset, items: Sequence[UALQuery], allow_missing: bool) -> List[str]:
+    missing = sorted({q.video_file for q in items if ds.video_paths.get(q.video_file) is None})
+    if missing:
+        msg = (f"{UAL_DISPLAY[ds.subset]}: {len(missing)} of {len({q.video_file for q in items})} "
+               f"videos not found in {ds.video_dirs} (e.g. {missing[:3]}). Download the videos "
+               f"(official README: wget -O {ds.subset}.tar "
+               f"https://huggingface.co/datasets/hasnat79/ual_bench/resolve/main/{ds.subset}.tar, "
+               f"then tar -xvf) and point --ual_video_root or --ual_{_ual_short(ds.subset)}_videos "
+               f"at them")
+        require(allow_missing, msg + ", or pass --ual_allow_missing_videos to score those items "
+                                     "as null predictions (official convention: IoU 0, TD = "
+                                     "gt end_time).")
+        LOG.warning("%s; scoring %d items as null predictions (--ual_allow_missing_videos)", msg,
+                    sum(1 for q in items if q.video_file in set(missing)))
+    return missing
+
+
+# -----------------------------------------------------------------------------
+# Isolation: work root, paths, cache namespace
+# -----------------------------------------------------------------------------
+
+def _ual_within(path: str, parent: str) -> bool:
+    p, q = os.path.realpath(path), os.path.realpath(parent)
+    return p == q or p.startswith(q.rstrip(os.sep) + os.sep)
+
+
+def ual_resolve_work_root(us: UALSettings, cfg: Config) -> str:
+    """Default: a sibling 'crux_v10_ual_work' of --ual_root, so the UAL-Bench data
+    (or repository clone) is never written to. Refuses any location inside the
+    VideoGlitchBench root or work dir, the GliDe repository or the UAL-Bench data."""
+    if us.work_root:
+        w = us.work_root
+    else:
+        require(bool(us.root), "pass --ual_work_root (or --ual_root, whose sibling "
+                               "'crux_v10_ual_work' is then used)")
+        w = os.path.join(os.path.dirname(os.path.abspath(us.root.rstrip(os.sep))),
+                         "crux_v10_ual_work")
+    w = os.path.abspath(w)
+    protected = [("VideoGlitchBench root (--root)", cfg.root),
+                 ("VideoGlitchBench work dir", cfg.paths()["work"])]
+    if cfg.glide_repo:
+        protected.append(("GliDe repository (--glide_repo)", cfg.glide_repo))
+    if us.root:
+        protected.append(("UAL-Bench data root (--ual_root)", us.root))
+    for d in [us.video_root, *us.subset_videos.values()]:
+        if d:
+            protected.append(("UAL-Bench video directory", d))
+    for p in [us.annotations, *us.subset_annotations.values()]:
+        if p:
+            protected.append(("UAL-Bench annotation directory", os.path.dirname(os.path.abspath(p))))
+    for name, d in protected:
+        require(not _ual_within(w, d), f"refusing UAL work root {w}: it lies inside the {name} "
+                                       f"{d}; pass --ual_work_root outside it")
+    return w
+
+
+def ual_paths(us: UALSettings, subset: str = "", backbone: str = "") -> Dict[str, str]:
+    base = os.path.join(us.work_root, "ual_bench")
+    out = {"base": base, "logs": os.path.join(base, "logs"),
+           "inspect": os.path.join(base, "inspect"),
+           "summary": os.path.join(base, "summary", us.mode, us.run_tag)}
+    if subset:
+        out["subset"] = os.path.join(base, subset)
+    if subset and backbone:
+        out["cache"] = os.path.join(base, subset, "cache", backbone)
+        out["run"] = os.path.join(base, subset, backbone, us.mode, us.run_tag)
+    return out
+
+
+def ual_prep_config(cfg: Config, us: UALSettings, subset: str) -> Config:
+    """A Config whose paths() point into the UAL subtree, so prepare_record (the
+    official GliDe geometry, unchanged) writes windows to
+    <work>/ual_bench/<subset>/windows/<prep fingerprint>/<video key>/."""
+    return Config(**{**asdict(cfg), "root": us.work_root,
+                     "work_subdir": os.path.join("ual_bench", subset)})
+
+
+def ual_cache_namespace(cfg: Config, ds: UALDataset, us: UALSettings) -> Dict[str, Any]:
+    """Part of every UAL VLM cache key. It is GT-free on purpose: the dataset is
+    identified by inputs_fingerprint, not by the annotation hash."""
+    return {"dataset": f"ual_bench/{ds.subset}", "inputs": ds.inputs_fingerprint,
+            "adapter": UAL_ADAPTER_VERSION, "prompt": UAL_PROMPT_VERSION, "crux": VERSION,
+            "mode": us.mode, "prep": cfg.prep_fingerprint(), "backbone": cfg.backbone,
+            "model": cfg.model, "top_logprobs": cfg.top_logprobs,
+            "sampling": build_generation_kwargs(cfg, 1)}
+
+
+class _UALKeyMixin:
+    ual_namespace: Dict[str, Any] = {}
+
+    def _key(self, kind, system, user, images, extra):
+        return sha1(json.dumps({"ual": self.ual_namespace,
+                                "k": super()._key(kind, system, user, images, extra)},
+                               sort_keys=True))
+
+
+class UALOpenAIVLM(_UALKeyMixin, OpenAIVLM):
+    pass
+
+
+class UALHFVLM(_UALKeyMixin, HFVLM):
+    pass
+
+
+class UALMockVLM(_UALKeyMixin, MockVLM):
+    pass
+
+
+def make_ual_vlm(cfg: Config, cache_dir: str, namespace: Dict[str, Any],
+                 oracle: Optional[Callable] = None) -> VLMBase:
+    if cfg.backend == "openai":
+        v: VLMBase = UALOpenAIVLM(cfg, cache_dir)
+    elif cfg.backend == "hf":
+        v = UALHFVLM(cfg, cache_dir)
+    elif cfg.backend == "mock":
+        require(oracle is not None, "mock backend needs an oracle")
+        v = UALMockVLM(cfg, cache_dir, oracle)
+    else:
+        raise ValueError(f"unknown backend {cfg.backend}")
+    v.ual_namespace = dict(namespace)
+    return v
+
+
+def _ual_switch_subset(vlm: VLMBase, cache_dir: str, namespace: Dict[str, Any]) -> None:
+    """Reuse one VLM (and, for hf, one loaded model) across subsets."""
+    os.makedirs(cache_dir, exist_ok=True)
+    vlm.cache_dir = cache_dir
+    vlm.ual_namespace = dict(namespace)
+
+
+# -----------------------------------------------------------------------------
+# Backbones: the three approved checkpoints only, no silent substitution
+# -----------------------------------------------------------------------------
+
+def ual_resolve_backbones(spec: Optional[str], default_all: bool = False) -> List[str]:
+    if not spec:
+        require(default_all, "pass --backbone {qwen2.5-vl-7b,internvl2.5-8b,ui-tars-1.5-7b,all}")
+        return list(UAL_BACKBONES)
+    keys = list(UAL_BACKBONES) if spec == "all" else [s.strip() for s in spec.split(",") if s.strip()]
+    for k in keys:
+        require(k in UAL_BACKBONES, f"backbone {k!r} is not part of the UAL-Bench experiment; "
+                                    f"allowed: {sorted(UAL_BACKBONES)} or 'all'")
+        require(BACKBONES[k]["hf"] == UAL_BACKBONES[k][1],
+                f"BACKBONES[{k!r}] = {BACKBONES[k]['hf']} differs from the approved "
+                f"{UAL_BACKBONES[k][1]}")
+    return list(dict.fromkeys(keys))
+
+
+def ual_backbone_config(cfg: Config, key: str, us: UALSettings, model_override: str = ""
+                        ) -> Config:
+    c = cfg.with_backbone(key)
+    require(not model_override or model_override == c.model,
+            f"--model {model_override} would replace the approved checkpoint {c.model} of "
+            f"{key}; the UAL-Bench experiment never substitutes checkpoints")
+    if key in us.api_bases:
+        c.api_base = us.api_bases[key]
+    return c
+
+
+def ual_preflight_backbone(c: Config) -> Dict[str, Any]:
+    """Cheap checks before any inference. openai: the server must list the exact
+    approved model id. hf: Qwen2.5-VL architecture only (Qwen2.5-VL-7B and
+    UI-TARS-1.5-7B); InternVL needs vLLM because its remote code hides logits."""
+    info: Dict[str, Any] = {"backend": c.backend, "model": c.model, "family": c.family}
+    if c.backend == "hf":
+        require(c.family == "qwen", f"{c.model}: the hf backend supports Qwen2.5-VL-architecture "
+                                    f"checkpoints only (Qwen2.5-VL-7B, UI-TARS-1.5-7B). Serve "
+                                    f"InternVL2.5-8B with vLLM (vllm serve {c.model} "
+                                    f"--trust-remote-code --max-logprobs 20) and use --backend "
+                                    f"openai --ual_api_bases internvl2.5-8b=<url>")
+        try:
+            from transformers import AutoConfig
+            arch = list(AutoConfig.from_pretrained(c.model).architectures or [])
+        except Exception as e:
+            raise RuntimeError(f"cannot read the config of {c.model}: {type(e).__name__}: {e}")
+        require("Qwen2_5_VLForConditionalGeneration" in arch,
+                f"{c.model} declares architectures {arch}; HFVLM loads "
+                f"Qwen2_5_VLForConditionalGeneration and would not run it correctly")
+        info["architectures"] = arch
+    elif c.backend == "openai":
+        import requests
+        url = f"{c.api_base.rstrip('/')}/models"
+        hdr = {"Authorization": f"Bearer {c.api_key}"} if c.api_key and c.api_key != "EMPTY" else {}
+        try:
+            r = requests.get(url, headers=hdr, timeout=30)
+            r.raise_for_status()
+            served = [str(m.get("id")) for m in (r.json().get("data") or [])]
+        except Exception as e:
+            raise RuntimeError(f"{c.backbone}: no OpenAI-compatible server at {c.api_base} "
+                               f"({type(e).__name__}: {e}). Start it, e.g. vllm serve {c.model} "
+                               f"--max-logprobs 20" + (" --trust-remote-code"
+                                                       if c.family == "internvl" else "")
+                               + f", and pass --ual_api_bases {c.backbone}=<url>/v1")
+        require(c.model in served, f"{c.backbone}: the server at {c.api_base} serves {served}, "
+                                   f"not {c.model}; refusing to substitute a checkpoint")
+        info["served_models"] = served
+        info["api_base"] = c.api_base
+    return info
+
+
+def ual_smoke_test(vlm: VLMBase, c: Config, ds: UALDataset, wins: Sequence[Window],
+                   q: UALQuery) -> Dict[str, Any]:
+    """One real presence score on a real UAL-Bench window plus its content-free
+    probe, before the full run. Fails with the exact backend error."""
+    usr = ual_presence_user(q.query)
+    try:
+        lo_w = binary_log_odds(vlm.score(P_UAL_PRESENCE_SYS, usr, [wins[0].stitch_path], YES_NO,
+                                         "ual_smoke"), "yes", "no")
+        cf = content_free_path(wins) if vlm.needs_pixels else "__content_free__"
+        lo_c = binary_log_odds(vlm.score(P_UAL_PRESENCE_SYS, usr, [cf], YES_NO, "ual_smoke"),
+                               "yes", "no")
+    except Exception as e:
+        raise RuntimeError(f"smoke test failed for {c.backbone} ({c.model}, backend {c.backend}) "
+                           f"on {UAL_DISPLAY[ds.subset]} item {q.item_id!r}: "
+                           f"{type(e).__name__}: {e}")
+    require(math.isfinite(lo_w) and math.isfinite(lo_c),
+            f"smoke test for {c.backbone}: non-finite log-odds ({lo_w}, {lo_c})")
+    return {"item_id": q.item_id, "window_log_odds": lo_w, "content_free_log_odds": lo_c}
+
+
+# -----------------------------------------------------------------------------
+# Preprocessing and Mode A inference (GT never passes through these functions)
+# -----------------------------------------------------------------------------
+
+@dataclass
+class _UALVideo:
+    """The three attributes prepare_record reads and writes."""
+    vid: str
+    video_path: str
+    duration: float = 0.0
+
+
+def ual_video_key(subset: str, video_file: str, path: Optional[str]) -> str:
+    stem = re.sub(r"[^A-Za-z0-9_.-]", "_", os.path.splitext(video_file)[0])[:80]
+    size = os.path.getsize(path) if path and os.path.exists(path) else -1
+    return f"{stem}_{sha1(f'{subset}/{video_file}:{size}')[:10]}"
+
+
+def ual_prepare_video(cfg: Config, us: UALSettings, ds: UALDataset, video_file: str,
+                      memo: Dict) -> Tuple[List[Window], float]:
+    """Official GliDe windowing via the unchanged prepare_record; one preparation
+    per video (SSBD items share videos), failures are memoised too."""
+    key = (ds.subset, cfg.prep_fingerprint(), video_file)
+    if key not in memo:
+        path = ds.video_paths.get(video_file)
+        try:
+            require(path is not None, f"video {video_file} not found")
+            shim = _UALVideo(ual_video_key(ds.subset, video_file, path), str(path))
+            wins = prepare_record(shim, ual_prep_config(cfg, us, ds.subset))
+            memo[key] = (wins, float(shim.duration or (wins[-1].end if wins else 0.0)))
+        except Exception as e:
+            memo[key] = e
+    val = memo[key]
+    if isinstance(val, Exception):
+        raise val
+    return val
+
+
+def ual_verify_query(vlm: VLMBase, wins: Sequence[Window], query: str, cfg: Config
+                     ) -> Tuple[float, List[float]]:
+    """CRUX V (verify_profile) with the official query as the hypothesis."""
+    usr = ual_presence_user(query)
+
+    def lo_of(path: str, stage: str) -> float:
+        return binary_log_odds(vlm.score(P_UAL_PRESENCE_SYS, usr, [path], YES_NO, stage),
+                               "yes", "no")
+    prior = 0.0
+    if cfg.use_contextual_calibration:
+        prior = lo_of(content_free_path(wins) if vlm.needs_pixels else "__content_free__",
+                      "ual_v_calib")
+    return prior, [lo_of(w.stitch_path, "ual_v_profile") - prior for w in wins]
+
+
+class UALPresenceOracle(PresenceOracle):
+    """PresenceOracle with the UAL prompt (the parent hard-codes the glitch prompt)."""
+
+    def __init__(self, vlm: VLMBase, wins: Sequence[Window], query: str, cfg: Config,
+                 margin: float = 0.0):
+        self.vlm, self.cfg, self.margin = vlm, cfg, float(margin)
+        self.by_idx = {w.idx: w for w in wins}
+        self.usr = ual_presence_user(query)
+        self.base = 0.0
+        if cfg.use_contextual_calibration and wins:
+            cf = content_free_path(wins) if vlm.needs_pixels else "__content_free__"
+            self.base = binary_log_odds(vlm.score(P_UAL_PRESENCE_SYS, self.usr, [cf], YES_NO,
+                                                  "ual_g_calib"), "yes", "no")
+        self.memo: Dict[Any, bool] = {}
+
+    def image(self, path: str, stage: str = "ual_g_frame") -> bool:
+        if path not in self.memo:
+            lo = binary_log_odds(self.vlm.score(P_UAL_PRESENCE_SYS, self.usr, [path], YES_NO,
+                                                stage), "yes", "no")
+            self.memo[path] = (lo - self.base) > self.margin
+        return self.memo[path]
+
+
+def ual_select_segment(profile: Sequence[float], tau: float, lam: float
+                       ) -> Tuple[Tuple[int, int], List[Tuple[int, int]]]:
+    """S with one output interval. With lambda = 1e9 segment_profile already
+    returns one segment (Kadane); for a finite lambda the segment with the
+    largest sum of (s - tau) is emitted (ties -> earliest)."""
+    segs = segment_profile(profile, tau, lam)
+    require(bool(segs), "segment_profile returned no segment")
+    x = np.asarray(profile, float) - float(tau)
+    best = max(segs, key=lambda ab: (float(x[ab[0]:ab[1] + 1].sum()), -ab[0]))
+    return (int(best[0]), int(best[1])), [(int(a), int(b)) for a, b in segs]
+
+
+def ual_infer_item(vlm: VLMBase, q: UALQuery, wins: Sequence[Window], duration: float,
+                   cfg: Config, us: UALSettings) -> Dict[str, Any]:
+    """Mode A for one item. Inputs are the query, the windows and the decoded
+    duration; no ground truth exists in this scope."""
+    require(len(wins) > 0, f"{q.item_id}: no windows")
+    audit = {"monotonicity_violations": 0, "frame_conflicts": 0}
+    prior, prof = ual_verify_query(vlm, wins, q.query, cfg)
+    tau, lam = float(us.seg_tau), float(us.seg_penalty)
+    (a, b), segs = ual_select_segment(prof, tau, lam)
+    lo_t, hi_t = wins[a].start, wins[b].end
+    window_span = (float(lo_t), float(hi_t))
+    if us.refine_mode == "frame" and cfg.use_subframe:
+        oracle = UALPresenceOracle(vlm, wins, q.query, cfg, tau)
+        v = cfg.use_verified_bisection
+        on_t, off_t = lo_t, hi_t
+        if prof[a] > tau:
+            k = frame_onset(oracle, wins[a], audit, v)
+            on_t = frame_time_bounds(wins[a], k, k, cfg.fps)[0]
+        if prof[b] > tau:
+            k = frame_offset(oracle, wins[b], audit, v)
+            off_t = frame_time_bounds(wins[b], k, k, cfg.fps)[1]
+        if off_t > on_t:
+            lo_t, hi_t = on_t, off_t
+        else:
+            audit["frame_conflicts"] += 1
+    ps, pe = clamp(float(lo_t), 0.0, duration), clamp(float(hi_t), 0.0, duration)
+    ok = pe > ps
+    return {"status": "ok" if ok else "degenerate_interval", "error": None,
+            "pred_start": round(ps, 6) if ok else None, "pred_end": round(pe, 6) if ok else None,
+            "decoded_duration": float(duration), "n_windows": len(wins),
+            "window_bounds": [[w.start, w.end] for w in wins], "prior": float(prior),
+            "profile": [float(x) for x in prof], "segments": [list(s) for s in segs],
+            "selected_segment": [a, b], "window_span": list(window_span),
+            "refine_mode": us.refine_mode, **audit}
+
+
+def ual_run_backbone(c: Config, us: UALSettings, ds: UALDataset, items: Sequence[UALQuery],
+                     vlm: VLMBase, memo: Dict, preflight: Dict, smoke: Optional[Dict]) -> str:
+    rp = ual_paths(us, ds.subset, c.backbone)
+    os.makedirs(rp["run"], exist_ok=True)
+    out_path = os.path.join(rp["run"], "raw_outputs.json")
+    outs: List[Dict[str, Any]] = []
+    t0, b_calls = time.time(), vlm.budget.calls
+
+    def payload(done: bool) -> Dict[str, Any]:
+        return {"dataset": "ual_bench", "subset": ds.subset, "backbone": c.backbone,
+                "model": c.model, "mode": us.mode, "partial": us.partial, "limit": us.limit,
+                "complete": done, "n_items": len(items),
+                "inputs_fingerprint": ds.inputs_fingerprint, "items": outs}
+    for i, q in enumerate(items):
+        before, st0, tr0 = vlm.budget.calls, dict(vlm.budget.by_stage), vlm.budget.logprob_truncations
+        rec: Dict[str, Any] = {"item_id": q.item_id, "video_id": q.video_id,
+                               "video_file": q.video_file, "query": q.query}
+        try:
+            wins, dur = ual_prepare_video(c, us, ds, q.video_file, memo)
+        except Exception as e:
+            st = "video_missing" if ds.video_paths.get(q.video_file) is None else "video_error"
+            if st == "video_error":
+                LOG.error("%s: cannot decode %s (%s: %s); scored as a null prediction", q.item_id,
+                          q.video_file, type(e).__name__, e)
+            rec.update({"status": st, "error": f"{type(e).__name__}: {e}", "pred_start": None,
+                        "pred_end": None, "decoded_duration": None})
+        else:
+            rec.update(ual_infer_item(vlm, q, wins, dur, c, us))   # VLM errors abort the run
+        rec["calls"] = vlm.budget.calls - before
+        rec["calls_by_stage"] = {k: v - st0.get(k, 0) for k, v in vlm.budget.by_stage.items()
+                                 if v - st0.get(k, 0) > 0}
+        rec["logprob_truncations"] = vlm.budget.logprob_truncations - tr0
+        outs.append(rec)
+        if (i + 1) % 25 == 0 or i + 1 == len(items):
+            LOG.info("%s | %s | %d/%d items | %.1f calls/item | %.1f min", UAL_DISPLAY[ds.subset],
+                     c.backbone, i + 1, len(items), (vlm.budget.calls - b_calls) / (i + 1),
+                     (time.time() - t0) / 60)
+        if (i + 1) % 100 == 0:
+            atomic_write_json(out_path.replace(".json", ".inprogress.json"), payload(False))
+    atomic_write_json(out_path, payload(True))
+    ip = out_path.replace(".json", ".inprogress.json")
+    if os.path.exists(ip):
+        os.remove(ip)
+    atomic_write_json(os.path.join(rp["run"], "manifest.json"),
+                      ual_manifest(c, us, ds, items, {"preflight": preflight, "smoke_test": smoke,
+                                                      "budget": asdict(vlm.budget)}))
+    LOG.info("wrote %s", out_path)
+    return out_path
+
+
+def ual_manifest(c: Config, us: UALSettings, ds: UALDataset, items: Sequence[UALQuery],
+                 extra: Dict[str, Any]) -> Dict[str, Any]:
+    import platform
+    vers: Dict[str, Any] = {"python": sys.version.split()[0], "platform": platform.platform(),
+                            "numpy": np.__version__,
+                            "opencv": getattr(cv2, "__version__", None) if cv2 else None}
+    try:
+        import scipy as _sp
+        vers["scipy"] = _sp.__version__
+    except Exception:
+        pass
+    for mod in ("torch", "transformers", "requests"):
+        if mod in sys.modules:
+            vers[mod] = getattr(sys.modules[mod], "__version__", None)
+    return {"crux_version": VERSION, "ual_adapter": UAL_ADAPTER_VERSION,
+            "prompt_version": UAL_PROMPT_VERSION, "mode": us.mode,
+            "mode_description": "Mode A: query-conditioned CRUX localisation core (V -> S + frame "
+                                "refinement); H and U not used",
+            "prompts": {"system": P_UAL_PRESENCE_SYS, "user_template": ual_presence_user("{query}")},
+            "selection_rule": {"seg_tau": us.seg_tau, "seg_penalty": us.seg_penalty,
+                               "refine_mode": us.refine_mode, "predeclared": us.predeclared(),
+                               "calibrated_on_ual": False},
+            "subset": ds.subset, "annotation_path": ds.annotation_path,
+            "annotation_sha256": ds.annotation_sha256, "inputs_fingerprint": ds.inputs_fingerprint,
+            "ssbd_time_format": us.ssbd_time_format if ds.subset == "uag_ssbd" else None,
+            "video_dirs": ds.video_dirs, "n_items": len(items), "n_items_in_annotation":
+            len(ds.queries), "partial": us.partial, "limit": us.limit,
+            "backbone": c.backbone, "model": c.model, "backend": c.backend,
+            "api_base": c.api_base if c.backend == "openai" else None,
+            "generation": build_generation_kwargs(c, 1), "top_logprobs": c.top_logprobs,
+            "max_pixels": c.max_pixels, "fps": c.fps, "window_size": c.window_size,
+            "prep_fingerprint": c.prep_fingerprint(), "seed": c.seed,
+            "crux_switches": {k: getattr(c, k) for k in asdict(c) if k.startswith("use_")},
+            "versions": vers, "argv": list(sys.argv),
+            "time_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), **extra}
+
+
+# -----------------------------------------------------------------------------
+# Official UAL-Bench evaluator: exact port of src/eval/eval_your_results.py
+# -----------------------------------------------------------------------------
+
+def ual_calculate_iou(gt_start: float, gt_end: float, pred_start: float, pred_end: float
+                      ) -> float:
+    """calculate_iou, verbatim (no clipping; raises on a zero union like the original)."""
+    intersection = max(0, min(gt_end, pred_end) - max(gt_start, pred_start))
+    union = (gt_end - gt_start) + (pred_end - pred_start) - intersection
+    return 1.0 * (intersection / union)
+
+
+def ual_calculate_abs_dist(gt_start: float, gt_end: float, pred_start: float, pred_end: float
+                           ) -> float:
+    """calculate_abs_dist: TD = |start error| + |end error| (a SUM, not a max)."""
+    return abs(gt_start - pred_start) + abs(gt_end - pred_end)
+
+
+def ual_per_item(result: Sequence[Dict]) -> Dict[str, List[float]]:
+    """Per-item quantities exactly as the official functions compute them:
+      iou      0 if pred_start or pred_end is None (eval_recall_1_iou)
+      td       gt end_time ('duration = gt_end') if either is None (abs_dist)
+      td_mean  td, replaced by gt end_time when td > 10000 (the mTD list)
+      onset_*  0 if either is None, else |gt_start - pred_start| <= 1 / 0.25"""
+    iou, td, tdm, on1, on025 = [], [], [], [], []
+    for v in result:
+        gs, ge = v["start_time"], v["end_time"]
+        duration = ge
+        none = v["pred_start"] is None or v["pred_end"] is None
+        if none:
+            i, d = 0.0, duration
+        else:
+            i = ual_calculate_iou(gs, ge, v["pred_start"], v["pred_end"])
+            d = ual_calculate_abs_dist(gs, ge, v["pred_start"], v["pred_end"])
+        iou.append(i)
+        td.append(d)
+        tdm.append(duration if d > 10000 else d)
+        on1.append(0.0 if none else float(abs(gs - v["pred_start"]) <= 1))
+        on025.append(0.0 if none else float(abs(gs - v["pred_start"]) <= 0.25))
+    return {"iou": iou, "td": td, "td_mean": tdm, "onset_1s": on1, "onset_025s": on025}
+
+
+def ual_official_metrics(result: Sequence[Dict]) -> Dict[str, Any]:
+    """All numbers printed by eval_your_results.py. Recalls and onset accuracies
+    are percentages (100 * correct / N); mIoU is a fraction; mTD is in seconds."""
+    n = len(result)
+    require(n > 0, "the official evaluator divides by len(result); got 0 items")
+    for v in result:
+        for k in UAL_OFFICIAL_KEYS[1:]:
+            x = v[k]
+            ok = ((x is None and k.startswith("pred"))
+                  or (isinstance(x, (int, float)) and not isinstance(x, bool)))
+            require(ok, f"{v.get('video_id')}: {k} must be a number"
+                        f"{' or null' if k.startswith('pred') else ''}, got {x!r}")
+    p = ual_per_item(result)
+    out: Dict[str, Any] = {"n": n, "n_null_predictions":
+                           sum(1 for v in result if v["pred_start"] is None or v["pred_end"] is None)}
+    for m in UAL_IOU_THRESHOLDS:
+        out[f"r1_iou_{m}"] = 100 * (sum(1 for i in p["iou"] if i >= m) / n)
+    out["miou"] = float(np.mean(p["iou"]))
+    for t in UAL_TD_THRESHOLDS:
+        out[f"r1_td_{t}"] = 100 * (sum(1 for d in p["td"] if d <= t) / n)
+    out["mtd"] = float(np.mean(p["td_mean"]))
+    out["onset_acc_1s"] = 100 * (sum(p["onset_1s"]) / n)
+    out["onset_acc_0.25s"] = 100 * (sum(p["onset_025s"]) / n)
+    return out
+
+
+def ual_format_like_official(m: Dict[str, Any]) -> Dict[str, str]:
+    """The values the official script prints, formatted as it prints them (:.2f)."""
+    keys = ([f"r1_iou_{x}" for x in UAL_IOU_THRESHOLDS] + ["miou"]
+            + [f"r1_td_{t}" for t in UAL_TD_THRESHOLDS] + ["mtd", "onset_acc_1s", "onset_acc_0.25s"])
+    return {k: f"{m[k]:.2f}" for k in keys}
+
+
+def ual_run_official_evaluator(repo: str, results_file: str) -> Dict[str, str]:
+    """Runs the unmodified official script (python -I) and parses its stdout."""
+    import subprocess
+    script = os.path.join(repo, "src", "eval", "eval_your_results.py")
+    require(os.path.isfile(script), f"official evaluator not found at {script}")
+    p = subprocess.run([sys.executable, "-I", script, "--results_file", results_file],
+                       capture_output=True, text=True, timeout=1800)
+    require(p.returncode == 0, f"official evaluator failed ({p.returncode}): {p.stderr[-2000:]}")
+    txt, out = p.stdout, {}
+    for thr, r1, miou in re.findall(r"IoU = ([\d.]+) R@1: ([\d.]+); mIoU: ([\d.]+)", txt):
+        out[f"r1_iou_{float(thr):g}"] = r1
+        out["miou"] = miou
+    for thr, r1, mtd in re.findall(r"Threshold m = (\d+)s R@1: ([\d.]+) mean abs distances: "
+                                   r"([\d.]+)", txt):
+        out[f"r1_td_{int(thr)}"] = r1
+        out["mtd"] = mtd
+    m1 = re.search(r"Accuracy within 1 sec: ([\d.]+)", txt)
+    m2 = re.search(r"Accuracy within 0.25 sec: ([\d.]+)", txt)
+    require(m1 is not None and m2 is not None, "could not parse the official evaluator output")
+    out["onset_acc_1s"], out["onset_acc_0.25s"] = m1.group(1), m2.group(1)
+    return out
+
+
+def ual_build_official_predictions(ds: UALDataset, raw_items: Sequence[Dict]) -> List[Dict]:
+    """The evaluator-ready file (output_test_template.json schema). This is the
+    only place where GT and predictions meet."""
+    out = []
+    for r in raw_items:
+        g = ds.gt[r["item_id"]]
+        out.append({"video_id": r["item_id"], "start_time": g.start_time, "end_time": g.end_time,
+                    "pred_start": r["pred_start"], "pred_end": r["pred_end"]})
+    return out
+
+
+# -----------------------------------------------------------------------------
+# Uncertainty (not part of the official protocol; reported separately)
+# -----------------------------------------------------------------------------
+
+def _ual_cluster_index(clusters: Sequence[str]) -> List[np.ndarray]:
+    g: Dict[str, List[int]] = defaultdict(list)
+    for i, c in enumerate(clusters):
+        g[c].append(i)
+    return [np.asarray(v, int) for v in g.values()]
+
+
+def ual_cluster_bootstrap_ci(values: Sequence[float], clusters: Sequence[str], B: int,
+                             seed: int, alpha: float = 0.05) -> Tuple[float, float]:
+    """Percentile CI of a mean, resampling VIDEOS (SSBD items of one video are
+    not independent). With 58-1589 clusters the percentile interval is adequate;
+    the small-G correction of cluster_bootstrap_auc is not needed here."""
+    v = np.asarray(values, float)
+    units = _ual_cluster_index(clusters)
+    if not units:
+        return float("nan"), float("nan")
+    sums = np.array([v[u].sum() for u in units])
+    sizes = np.array([u.size for u in units], float)
+    rng = np.random.default_rng(seed)
+    means = []
+    for _ in range(0, B, 500):
+        d = rng.integers(0, len(units), size=(min(500, B - len(means)), len(units)))
+        means.extend((sums[d].sum(1) / sizes[d].sum(1)).tolist())
+    return (float(np.percentile(means, 100 * alpha / 2)),
+            float(np.percentile(means, 100 * (1 - alpha / 2))))
+
+
+def ual_paired_signflip(a: Sequence[float], b: Sequence[float], clusters: Sequence[str],
+                        B: int, seed: int) -> Dict[str, Any]:
+    """Randomisation test of H0: the two backbones' per-item values are
+    exchangeable within every video. Statistic: mean difference; each video's
+    differences flip sign jointly. Exact when 2^G <= B, else Monte Carlo with
+    the (1 + k) / (1 + B) correction."""
+    d = np.asarray(a, float) - np.asarray(b, float)
+    units = _ual_cluster_index(clusters)
+    D = np.array([d[u].sum() for u in units])
+    n, G = d.size, len(units)
+    obs = float(d.mean()) if n else 0.0
+    tol = 1e-12
+    if G <= 20 and 2 ** G <= B:
+        import itertools
+        st = [float(np.dot(s, D)) / n for s in itertools.product((-1.0, 1.0), repeat=G)]
+        return {"delta": obs, "p": float(np.mean([abs(x) >= abs(obs) - tol for x in st])),
+                "n_clusters": G, "exact": True}
+    rng = np.random.default_rng(seed)
+    k, done = 0, 0
+    while done < B:
+        m = min(1000, B - done)
+        s = rng.choice((-1.0, 1.0), size=(m, G))
+        k += int(np.sum(np.abs(s @ D / n) >= abs(obs) - tol))
+        done += m
+    return {"delta": obs, "p": float((1 + k) / (1 + B)), "n_clusters": G, "exact": False}
+
+
+# -----------------------------------------------------------------------------
+# Evaluation of runs and the summary tables
+# -----------------------------------------------------------------------------
+
+def ual_evaluate_run(us: UALSettings, ds: UALDataset, raw_path: str) -> Dict[str, Any]:
+    raw = read_json(raw_path)
+    require(raw.get("complete", False), f"{raw_path} is an unfinished run")
+    require(raw.get("inputs_fingerprint") == ds.inputs_fingerprint,
+            f"{raw_path} was produced from a different annotation version "
+            f"({raw.get('inputs_fingerprint')} vs {ds.inputs_fingerprint})")
+    items = raw["items"]
+    ids = [r["item_id"] for r in items]
+    require(len(set(ids)) == len(ids) and set(ids) <= set(ds.gt),
+            f"{raw_path}: item ids are duplicated or unknown to the annotation file")
+    preds = ual_build_official_predictions(ds, items)
+    metrics = ual_official_metrics(preds)
+    run_dir = os.path.dirname(raw_path)
+    pred_path = os.path.join(run_dir, "predictions_official.json")
+    atomic_write_json(pred_path, preds)
+    parity = None
+    if us.official_repo:
+        off = ual_run_official_evaluator(us.official_repo, pred_path)
+        mine = ual_format_like_official(metrics)
+        diff = {k: (mine[k], off.get(k)) for k in mine if mine[k] != off.get(k)}
+        require(not diff, f"port disagrees with the official evaluator on {pred_path}: {diff}")
+        parity = {"official_script": os.path.join(us.official_repo, "src/eval/eval_your_results.py"),
+                  "identical_to_2_decimals": True}
+    status = defaultdict(int)
+    for r in items:
+        status[r["status"]] += 1
+    calls = sum(int(r.get("calls", 0)) for r in items)
+    trunc = sum(int(r.get("logprob_truncations", 0)) for r in items)
+    beyond = [ds.gt[r["item_id"]].end_time - r["decoded_duration"] for r in items
+              if r.get("decoded_duration") is not None
+              and ds.gt[r["item_id"]].end_time > r["decoded_duration"] + 1e-6]
+    diag = {"status_counts": dict(status), "calls_per_item": calls / max(1, len(items)),
+            "logprob_truncation_rate": trunc / max(1, calls),
+            "monotonicity_violations": sum(int(r.get("monotonicity_violations", 0)) for r in items),
+            "frame_conflicts": sum(int(r.get("frame_conflicts", 0)) for r in items),
+            "gt_end_beyond_decoded_duration": {"n": len(beyond),
+                                               "max_excess_s": max(beyond) if beyond else 0.0}}
+    if ds.subset == "uag_ssbd" and beyond and max(beyond) > 1.0:
+        LOG.warning("UAG-SSBD: %d GT intervals end more than 1 s after the decoded video (max "
+                    "%.1f s); check --ual_ssbd_time_format (%s)", len(beyond), max(beyond),
+                    us.ssbd_time_format)
+    res = {"subset": ds.subset, "backbone": raw["backbone"], "model": raw["model"],
+           "mode": raw["mode"], "partial": raw["partial"], "limit": raw["limit"],
+           "official_metrics": metrics, "official_script_parity": parity,
+           "diagnostics_not_official": diag, "raw_outputs": raw_path,
+           "predictions_official": pred_path}
+    atomic_write_json(os.path.join(run_dir, "metrics.json"), res)
+    res["_items"] = items
+    res["_preds"] = preds
+    return res
+
+
+def _ual_fmt(x: Optional[float], nd: int = 2) -> str:
+    return "n/a" if x is None or (isinstance(x, float) and math.isnan(x)) else f"{x:.{nd}f}"
+
+
+def ual_selection_tag(subsets: Sequence[str], backbones: Sequence[str]) -> str:
+    st = "all" if set(subsets) == set(UAL_SUBSETS) else "+".join(subsets)
+    bt = "all" if set(backbones) == set(UAL_BACKBONES) else "+".join(backbones)
+    return f"{st}__{bt}"
+
+
+_UAL_ECHO = [True]
+
+
+def ual_write_summary(cfg: Config, us: UALSettings, datasets: Dict[str, UALDataset],
+                      results: Dict[str, Dict[str, Dict[str, Any]]],
+                      backbones: Sequence[str]) -> str:
+    """Markdown / CSV / JSON summary: one official table per subset with the
+    exact required header, then supplementary official metrics, then clearly
+    labelled non-official diagnostics. No aggregation across subsets. Written
+    to summary/<mode>/<full|partial_limitN>/<subsets>__<backbones>/."""
+    sp = os.path.join(ual_paths(us)["summary"], ual_selection_tag(us.subsets, backbones))
+    os.makedirs(sp, exist_ok=True)
+    L: List[str] = []
+    status = (f"PARTIAL RUN (--limit {us.limit}): the first {us.limit} items of each subset; NOT "
+              f"benchmark results" if us.partial else "FULL RUN (all evaluation items)")
+    L += ["# CRUX v10 on UAL-Bench: Mode A (query-conditioned CRUX localisation core)", "",
+          f"**Status: {status}**", "",
+          "- Mode A: the official query is the CRUX hypothesis; CRUX V (contextually calibrated "
+          "presence profile) and S (exact segmentation, K = 1) with masked-frame boundary "
+          "refinement. The open-ended H stage and the U selector are not used, so this is not an "
+          "evaluation of the full H -> V -> S -> U pipeline.",
+          f"- Selection rule fixed before any UAL result: tau = {us.seg_tau:g}, lambda = "
+          f"{us.seg_penalty:g}, refine = {us.refine_mode}"
+          + ("" if us.predeclared() else " **(deviates from the predeclared tau = 0, lambda = 1e9, "
+                                         "refine = frame)**") + "; nothing was calibrated on UAL-Bench.",
+          "- Metrics: exact port of the official evaluator (Hasnat79/UAL_Bench "
+          "src/eval/eval_your_results.py)" + (", cross-checked against the unmodified official "
+                                              "script on every predictions file"
+                                              if us.official_repo else "") + ".",
+          "- R@1 values and onset accuracies are percentages (100 x correct / N). mIoU is a "
+          "fraction in [0, 1]. mTD is in seconds; TD = |start error| + |end error|; a null "
+          "prediction counts as IoU 0 and TD = gt end_time (official convention).",
+          "- Results are not aggregated across subsets (different domains, sizes and query "
+          "types). Published UAL-Bench numbers are not included here; compare only with the "
+          "same subset, metric and protocol, and label them as published.", ""]
+    rows_csv: List[Dict[str, Any]] = []
+    out_json: Dict[str, Any] = {"status": status, "partial": us.partial, "limit": us.limit,
+                                "mode": us.mode, "selection_rule": {
+                                    "seg_tau": us.seg_tau, "seg_penalty": us.seg_penalty,
+                                    "refine_mode": us.refine_mode,
+                                    "predeclared": us.predeclared()}, "subsets": {}}
+    for s in us.subsets:
+        res = results.get(s, {})
+        ds = datasets[s]
+        L += [f"## {UAL_DISPLAY[s]}", ""]
+        if not res:
+            L += ["No completed run for this subset.", ""]
+            continue
+        # Align backbones by item id in official order; compare on the intersection
+        # only if the item sets differ (and say so).
+        by = {k: {r["item_id"]: (r, p) for r, p in zip(v["_items"], v["_preds"])}
+              for k, v in res.items()}
+        common = [q.item_id for q in ds.queries if all(q.item_id in by[k] for k in by)]
+        same = all(len(by[k]) == len(common) for k in by)
+        n_videos = len({by[next(iter(by))][i][0]["video_file"] for i in common})
+        L += [f"N = {len(common)} evaluation items over {n_videos} videos"
+              + ("" if same else " (INTERSECTION; the backbones were run on different item "
+                                 "sets: " + ", ".join(f"{k}: {len(v)}" for k, v in by.items())
+                 + ")") + ".", ""]
+        if s == "uag_ssbd":
+            L += [f"SSBD 'time' read as {us.ssbd_time_format.upper()} (see UAL_BENCH_NOTES.md).", ""]
+        if s == "uag_funqa":
+            L += ["Every UAG-FunQA query is the same instruction (\"Identify the video's funny "
+                  "moment.\"), so conditioning on it carries no item-specific information.", ""]
+        sub: Dict[str, Any] = {}
+        for k, v in res.items():
+            items = [by[k][i][0] for i in common]
+            preds = [by[k][i][1] for i in common]
+            sub[k] = {"m": ual_official_metrics(preds), "p": ual_per_item(preds), "items": items,
+                      "clusters": [r["video_file"] for r in items],
+                      "diag": v["diagnostics_not_official"]}
+        L += [UAL_MAIN_HEADER, " | ".join(["---"] * 9)]
+        for k in UAL_BACKBONES:
+            if k in sub:
+                m = sub[k]["m"]
+                L.append(" | ".join([UAL_BACKBONES[k][0]] + [_ual_fmt(m[f"r1_iou_{x}"]) for x in
+                                                            UAL_IOU_THRESHOLDS]
+                                    + [_ual_fmt(m[f"r1_td_{t}"]) for t in (0, 1, 3, 5)]
+                                    + [_ual_fmt(m["mtd"])]))
+        L += ["", "Supplementary official metrics (outputs of the official evaluator that are not "
+                  "in the main table):", "",
+              "Model | mIoU | R@1,TD≤7 | Onset acc. ≤1 s | Onset acc. ≤0.25 s",
+              "--- | --- | --- | --- | ---"]
+        for k in UAL_BACKBONES:
+            if k in sub:
+                m = sub[k]["m"]
+                L.append(f"{UAL_BACKBONES[k][0]} | {_ual_fmt(m['miou'], 3)} | "
+                         f"{_ual_fmt(m['r1_td_7'])} | {_ual_fmt(m['onset_acc_1s'])} | "
+                         f"{_ual_fmt(m['onset_acc_0.25s'])}")
+        L += ["", "Diagnostics (NOT official metrics; 95% CIs by video-cluster bootstrap, "
+                  f"B = {cfg.n_bootstrap}):", "",
+              "Model | null predictions | Yes/No outside top-logprobs (share of calls) | VLM "
+              "calls/item | 95% CI mIoU | 95% CI R@1,0.5 | 95% CI mTD",
+              "--- | --- | --- | --- | --- | --- | ---"]
+        for k in UAL_BACKBONES:
+            if k not in sub:
+                continue
+            p, cl, d = sub[k]["p"], sub[k]["clusters"], sub[k]["diag"]
+            ci_i = ual_cluster_bootstrap_ci(p["iou"], cl, cfg.n_bootstrap, cfg.seed)
+            ci_r = ual_cluster_bootstrap_ci([100.0 * (x >= 0.5) for x in p["iou"]], cl,
+                                            cfg.n_bootstrap, cfg.seed + 1)
+            ci_t = ual_cluster_bootstrap_ci(p["td_mean"], cl, cfg.n_bootstrap, cfg.seed + 2)
+            sub[k]["ci"] = {"miou": ci_i, "r1_iou_0.5": ci_r, "mtd": ci_t}
+            L.append(f"{UAL_BACKBONES[k][0]} | {sub[k]['m']['n_null_predictions']} | "
+                     f"{100 * d['logprob_truncation_rate']:.1f}% | {d['calls_per_item']:.1f} | "
+                     f"[{ci_i[0]:.3f}, {ci_i[1]:.3f}] | [{ci_r[0]:.2f}, {ci_r[1]:.2f}] | "
+                     f"[{ci_t[0]:.2f}, {ci_t[1]:.2f}]")
+        ref = next(iter(sub.values()))
+        triv = [{"video_id": r["item_id"], "start_time": ds.gt[r["item_id"]].start_time,
+                 "end_time": ds.gt[r["item_id"]].end_time,
+                 "pred_start": 0.0 if r.get("decoded_duration") else None,
+                 "pred_end": float(r["decoded_duration"]) if r.get("decoded_duration") else None}
+                for r in ref["items"]]
+        tm = ual_official_metrics(triv)
+        L += ["", "Reference, NOT a model: the whole-video span [0, decoded duration] scored by "
+                  "the same evaluator (any localiser should beat it):", "", UAL_MAIN_HEADER,
+              " | ".join(["---"] * 9),
+              " | ".join(["Whole video (no model)"] + [_ual_fmt(tm[f"r1_iou_{x}"]) for x in
+                                                       UAL_IOU_THRESHOLDS]
+                         + [_ual_fmt(tm[f"r1_td_{t}"]) for t in (0, 1, 3, 5)]
+                         + [_ual_fmt(tm["mtd"])]), ""]
+        keys = [k for k in UAL_BACKBONES if k in sub]
+        pairs = [(x, y) for i, x in enumerate(keys) for y in keys[i + 1:]]
+        tests: Dict[str, Any] = {}
+        if pairs:
+            for metric, field_ in (("miou", "iou"), ("mtd", "td_mean")):
+                pv = {}
+                for x, y in pairs:
+                    t = ual_paired_signflip(sub[x]["p"][field_], sub[y]["p"][field_],
+                                            sub[x]["clusters"], cfg.n_permutations, cfg.seed)
+                    tests[f"{x} vs {y}|{metric}"] = t
+                    pv[f"{x} vs {y}|{metric}"] = t["p"]
+                for kk, hv in holm_bonferroni(pv).items():
+                    tests[kk]["holm_reject_0.05"] = hv["reject"]
+            L += ["Paired backbone comparisons (NOT official; video-cluster sign-flip "
+                  f"randomisation test, B = {cfg.n_permutations}, Holm-corrected per metric):", "",
+                  "Comparison | ΔmIoU | p | Holm reject | ΔmTD (s) | p | Holm reject",
+                  "--- | --- | --- | --- | --- | --- | ---"]
+            for x, y in pairs:
+                a_, b_ = tests[f"{x} vs {y}|miou"], tests[f"{x} vs {y}|mtd"]
+                L.append(f"{UAL_BACKBONES[x][0]} vs {UAL_BACKBONES[y][0]} | {a_['delta']:+.3f} | "
+                         f"{a_['p']:.4f} | {a_['holm_reject_0.05']} | {b_['delta']:+.2f} | "
+                         f"{b_['p']:.4f} | {b_['holm_reject_0.05']}")
+            L.append("")
+        out_json["subsets"][s] = {
+            "n_items": len(common), "same_item_set_for_all_backbones": same,
+            "item_counts": {k: len(v) for k, v in by.items()},
+            "official": {k: v["m"] for k, v in sub.items()},
+            "diagnostics_not_official": {k: {**v["diag"], "ci95": v.get("ci")} for k, v in
+                                         sub.items()},
+            "whole_video_reference": tm, "paired_tests": tests,
+            "annotation_sha256": ds.annotation_sha256, "inputs_fingerprint": ds.inputs_fingerprint}
+        for k, v in sub.items():
+            rows_csv.append({"subset": s, "model": UAL_BACKBONES[k][0], "hf_id": UAL_BACKBONES[k][1],
+                             "partial": us.partial, **{kk: v["m"][kk] for kk in v["m"]}})
+    md = os.path.join(sp, "results.md")
+    with open(md, "w", encoding="utf-8") as f:
+        f.write("\n".join(L) + "\n")
+    atomic_write_json(os.path.join(sp, "results.json"), out_json)
+    if rows_csv:
+        import csv
+        cols = list(rows_csv[0])
+        with open(os.path.join(sp, "results.csv"), "w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=cols)
+            w.writeheader()
+            w.writerows(rows_csv)
+    if _UAL_ECHO[0]:
+        print("\n".join(L))
+    LOG.info("wrote %s (+ results.csv, results.json)", md)
+    return md
+
+
+# -----------------------------------------------------------------------------
+# Commands
+# -----------------------------------------------------------------------------
+
+def ual_header_duration(path: str) -> Optional[float]:
+    """frame count / fps from the container header: the duration formula of
+    extract_frames_official, without decoding."""
+    if cv2 is None or not path:
+        return None
+    cap = cv2.VideoCapture(path)
+    if not cap.isOpened():
+        return None
+    fps, n = cap.get(cv2.CAP_PROP_FPS), cap.get(cv2.CAP_PROP_FRAME_COUNT)
+    cap.release()
+    return float(n / fps) if fps and fps > 0 else None
+
+
+def ual_banner(cfg: Config, us: UALSettings, backbones: Sequence[str],
+               datasets: Dict[str, UALDataset], items: Dict[str, List[UALQuery]], phase: str
+               ) -> None:
+    LOG.info("=" * 96)
+    LOG.info("CRUX v%s | UAL-Bench | %s | mode=%s (%s)", VERSION, phase, us.mode, UAL_ADAPTER_VERSION)
+    LOG.info("subsets: %s", ", ".join(f"{UAL_DISPLAY[s]} ({len(items[s])} of "
+                                      f"{len(datasets[s].queries)} items)" for s in us.subsets))
+    for s in us.subsets:
+        LOG.info("  %s annotations: %s (sha256 %s)", UAL_DISPLAY[s], datasets[s].annotation_path,
+                 datasets[s].annotation_sha256[:12])
+        LOG.info("  %s video dirs: %s", UAL_DISPLAY[s], datasets[s].video_dirs)
+    for k in backbones:
+        LOG.info("backbone %s -> %s (backend %s%s)", k, UAL_BACKBONES[k][1], cfg.backend,
+                 f", api {us.api_bases.get(k, cfg.api_base)}" if cfg.backend == "openai" else "")
+    LOG.info("input: fps=%g window=%d frames max_pixels=%d prep=%s | selection: tau=%g "
+             "lambda=%g refine=%s%s", cfg.fps, cfg.window_size, cfg.max_pixels,
+             cfg.prep_fingerprint(), us.seg_tau, us.seg_penalty, us.refine_mode,
+             "" if us.predeclared() else "  ** NOT the predeclared rule **")
+    LOG.info("output: %s", ual_paths(us)["base"])
+    if us.partial:
+        LOG.info("PARTIAL RUN: --limit %d; outputs go to '%s' and are NOT benchmark results",
+                 us.limit, us.run_tag)
+    LOG.info("=" * 96)
+
+
+def cmd_inspect_ual(cfg: Config, us: UALSettings) -> Dict[str, Any]:
+    """Schema audit without any VLM: paths, hashes, counts, fields, GT statistics,
+    media availability and the timestamp conventions (OOPS end = clip end, SSBD
+    time format) checked against container durations when videos are present."""
+    report: Dict[str, Any] = {}
+    for s in us.subsets:
+        ds = ual_load_dataset(us, s)
+        data = read_json(ds.annotation_path)
+        rows = list(data.values()) if isinstance(data, dict) else [
+            (e[1] if s == "uag_ssbd" else e) for e in data]
+        fields = sorted({k for r in rows for k in r})
+        g = list(ds.gt.values())
+        lens = [x.end_time - x.start_time for x in g]
+        per_video = defaultdict(int)
+        for q in ds.queries:
+            per_video[q.video_file] += 1
+        qcount = defaultdict(int)
+        for q in ds.queries:
+            qcount[q.query] += 1
+        present = {vf: p for vf, p in ds.video_paths.items() if p}
+        a: Dict[str, Any] = {
+            "annotation_path": ds.annotation_path, "annotation_sha256": ds.annotation_sha256,
+            "inputs_fingerprint": ds.inputs_fingerprint, "fields": fields,
+            "n_records": len(rows), "n_items": len(ds.queries), "n_videos": len(per_video),
+            "max_items_per_video": max(per_video.values()),
+            "videos_with_multiple_items": sum(1 for v in per_video.values() if v > 1),
+            "n_unique_queries": len(qcount),
+            "most_common_queries": sorted(qcount.items(), key=lambda kv: -kv[1])[:3],
+            "gt_start_range": [min(x.start_time for x in g), max(x.start_time for x in g)],
+            "gt_end_range": [min(x.end_time for x in g), max(x.end_time for x in g)],
+            "gt_length_mean_median_min_max": [float(np.mean(lens)), float(np.median(lens)),
+                                              min(lens), max(lens)],
+            "n_zero_length_gt": sum(1 for x in lens if x == 0),
+            "video_dirs": ds.video_dirs, "n_videos_present": len(present),
+            "n_videos_missing": len(per_video) - len(present),
+            "missing_examples": sorted(set(per_video) - set(present))[:5],
+            "example_items": [{"item_id": q.item_id, "query": q.query,
+                               "start_time": ds.gt[q.item_id].start_time,
+                               "end_time": ds.gt[q.item_id].end_time,
+                               "source": ds.gt[q.item_id].source} for q in ds.queries[:2]]}
+        dur = {vf: ual_header_duration(p) for vf, p in present.items()}
+        if s == "uag_oops":
+            a["end_time_multiple_of_0.125"] = sum(1 for x in g if abs(x.end_time * 8 -
+                                                                       round(x.end_time * 8)) < 1e-9)
+        if dur:
+            ex = [(q.item_id, ds.gt[q.item_id].end_time, dur[q.video_file]) for q in ds.queries
+                  if dur.get(q.video_file)]
+            a["checked_against_video_durations"] = len(ex)
+            a["gt_end_beyond_duration"] = sum(1 for _, e, d in ex if e > d + 1e-6)
+            a["gt_end_within_0.25s_of_duration"] = sum(1 for _, e, d in ex if abs(e - d) <= 0.25)
+            a["max_gt_end_minus_duration_s"] = max(e - d for _, e, d in ex) if ex else None
+            a["duration_examples"] = [{"item_id": i, "gt_end": e, "header_duration": d}
+                                      for i, e, d in ex[:3]]
+            if s == "uag_ssbd":
+                alt = "seconds" if us.ssbd_time_format == "mmss" else "mmss"
+                verdict = {}
+                for fmt in (us.ssbd_time_format, alt):
+                    beyond, bad = 0, 0
+                    for q in ds.queries:
+                        d = dur.get(q.video_file)
+                        if not d:
+                            continue
+                        try:
+                            _, e = ual_parse_ssbd_time(ds.gt[q.item_id].source, fmt)
+                        except RuntimeError:
+                            bad += 1
+                            continue
+                        beyond += int(e > d + 1.0)
+                    verdict[fmt] = {"intervals_ending_>1s_after_video": beyond,
+                                    "unparseable": bad}
+                a["ssbd_time_format_check"] = verdict
+        report[s] = a
+        print(f"\n== {UAL_DISPLAY[s]} schema audit ==")
+        print(json.dumps(_jsonable(a), indent=2))
+    out = os.path.join(ual_paths(us)["inspect"], "schema_audit.json")
+    atomic_write_json(out, report)
+    LOG.info("wrote %s", out)
+    return report
+
+
+def cmd_run_ual(cfg: Config, us: UALSettings, backbones: Sequence[str],
+                oracle: Optional[Callable] = None, model_override: str = "") -> str:
+    """Load and validate every subset, check every backbone, then infer and
+    evaluate. Nothing expensive starts before all checks pass."""
+    require(us.mode == "query_conditioned", MODE_B_MESSAGE)
+    require(cfg.use_segmentation and cfg.use_hypothesis_scoring,
+            "UAL Mode A needs CRUX S and V (use_segmentation, use_hypothesis_scoring)")
+    if cfg.use_utility_selection:
+        LOG.info("U (utility selection) is bypassed in Mode A: one interval per item, and the "
+                 "VideoGlitchBench-fitted selector is not valid for UAL-Bench")
+    datasets = {s: ual_load_dataset(us, s) for s in us.subsets}
+    items = {s: ual_select_items(ds, us.limit) for s, ds in datasets.items()}
+    for s, ds in datasets.items():
+        ual_check_media(ds, items[s], us.allow_missing_videos)
+    bcfg = {k: ual_backbone_config(cfg, k, us, model_override) for k in backbones}
+    pre = {k: ual_preflight_backbone(c) for k, c in bcfg.items()}
+    ual_banner(cfg, us, backbones, datasets, items, "inference + official evaluation")
+    memo: Dict = {}
+    runs: Dict[str, Dict[str, str]] = defaultdict(dict)
+    for k in backbones:
+        c, vlm = bcfg[k], None
+        for s in us.subsets:
+            ds = datasets[s]
+            ns, cache = ual_cache_namespace(c, ds, us), ual_paths(us, s, k)["cache"]
+            if vlm is None:
+                vlm = make_ual_vlm(c, cache, ns, oracle)
+            else:
+                _ual_switch_subset(vlm, cache, ns)
+            smoke = None
+            first = next((q for q in items[s] if ds.video_paths.get(q.video_file)), None)
+            if first is not None:
+                try:
+                    w0, _ = ual_prepare_video(c, us, ds, first.video_file, memo)
+                except Exception as e:
+                    LOG.warning("smoke test skipped: %s does not decode (%s)", first.video_file, e)
+                else:
+                    smoke = ual_smoke_test(vlm, c, ds, w0, first)
+                    LOG.info("smoke test %s on %s: %s", k, UAL_DISPLAY[s], smoke)
+            runs[s][k] = ual_run_backbone(c, us, ds, items[s], vlm, memo, pre[k], smoke)
+        del vlm
+        if c.backend == "hf":
+            try:
+                import torch
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
+    results = {s: {k: ual_evaluate_run(us, datasets[s], p) for k, p in runs[s].items()}
+               for s in us.subsets}
+    return ual_write_summary(cfg, us, datasets, results, backbones)
+
+
+def cmd_evaluate_ual(cfg: Config, us: UALSettings, backbones: Sequence[str]) -> str:
+    """Re-evaluate saved runs (no model calls) and rebuild the summary."""
+    datasets = {s: ual_load_dataset(us, s) for s in us.subsets}
+    items = {s: ual_select_items(ds, us.limit) for s, ds in datasets.items()}
+    ual_banner(cfg, us, backbones, datasets, items, "evaluation only (no model calls)")
+    results: Dict[str, Dict[str, Dict[str, Any]]] = {}
+    for s in us.subsets:
+        results[s] = {}
+        for k in backbones:
+            p = os.path.join(ual_paths(us, s, k)["run"], "raw_outputs.json")
+            if os.path.exists(p):
+                results[s][k] = ual_evaluate_run(us, datasets[s], p)
+            else:
+                LOG.warning("no %s run for %s / %s at %s", us.run_tag, UAL_DISPLAY[s], k, p)
+    require(any(results.values()), "no completed UAL-Bench run found; run 'run_ual' first")
+    return ual_write_summary(cfg, us, datasets, results,
+                             [k for k in backbones if any(k in r for r in results.values())])
+
+
+def cmd_evaluate_ual_file(path: str, official_repo: str = "") -> Dict[str, Any]:
+    """Official metrics of any file in the output_test_template.json schema."""
+    data = read_json(path)
+    require(isinstance(data, list) and all(isinstance(r, dict) and set(UAL_OFFICIAL_KEYS) <= set(r)
+                                           for r in data),
+            f"{path} is not in the official schema (a list of {list(UAL_OFFICIAL_KEYS)})")
+    m = ual_official_metrics(data)
+    print(json.dumps({"file": os.path.abspath(path), "official_metrics": m}, indent=2))
+    if official_repo:
+        off, mine = ual_run_official_evaluator(official_repo, path), ual_format_like_official(m)
+        diff = {k: (mine[k], off.get(k)) for k in mine if mine[k] != off.get(k)}
+        require(not diff, f"port disagrees with the official evaluator: {diff}")
+        print("identical to the official evaluator (to its printed 2 decimals)")
+    return m
+
+
+def _parse_api_bases(txt: str) -> Dict[str, str]:
+    out: Dict[str, str] = {}
+    for part in [p.strip() for p in (txt or "").split(",") if p.strip()]:
+        require("=" in part, f"--ual_api_bases entry {part!r} is not backbone=url")
+        k, v = part.split("=", 1)
+        require(k.strip() in UAL_BACKBONES, f"--ual_api_bases: unknown backbone {k.strip()!r}")
+        out[k.strip()] = v.strip()
+    return out
+
+
+def ual_settings_from_args(a: argparse.Namespace) -> UALSettings:
+    require(bool(a.ual_dataset), "pass --ual_dataset {uag_oops,uag_ssbd,uag_funqa,all}")
+    subsets = UAL_SUBSETS if a.ual_dataset == "all" else (a.ual_dataset,)
+    require(not (a.ual_annotations and len(subsets) > 1),
+            "--ual_annotations names one file; with --ual_dataset all use "
+            "--ual_oops_annotations / --ual_ssbd_annotations / --ual_funqa_annotations")
+    us = UALSettings(
+        subsets=tuple(subsets), root=a.ual_root or "", annotations=a.ual_annotations or "",
+        video_root=a.ual_video_root or "",
+        subset_annotations={s: getattr(a, f"ual_{_ual_short(s)}_annotations") for s in UAL_SUBSETS
+                            if getattr(a, f"ual_{_ual_short(s)}_annotations")},
+        subset_videos={s: getattr(a, f"ual_{_ual_short(s)}_videos") for s in UAL_SUBSETS
+                       if getattr(a, f"ual_{_ual_short(s)}_videos")},
+        work_root=a.ual_work_root or "", mode=a.ual_mode, seg_tau=float(a.ual_seg_tau),
+        seg_penalty=float(a.ual_seg_penalty), refine_mode=a.ual_refine_mode,
+        ssbd_time_format=a.ual_ssbd_time_format, allow_missing_videos=bool(a.ual_allow_missing_videos),
+        api_bases=_parse_api_bases(a.ual_api_bases), limit=a.limit,
+        official_repo=a.ual_repo or "")
+    require(us.mode in UAL_MODES, f"--ual_mode must be one of {UAL_MODES}")
+    require(us.refine_mode in UAL_REFINE_MODES, f"--ual_refine_mode must be one of {UAL_REFINE_MODES}")
+    require(math.isfinite(us.seg_tau) and us.seg_penalty >= 0, "invalid --ual_seg_tau/penalty")
+    require(us.limit is None or us.limit > 0, "--limit must be positive")
+    return us
+
+
+def _legacy_dataset_guard(a: argparse.Namespace) -> None:
+    """VideoGlitchBench commands stay VideoGlitchBench-only."""
+    require((a.dataset or "videoglitchbench") == "videoglitchbench",
+            f"'{a.command}' is a VideoGlitchBench command; for UAL-Bench use inspect_ual, run_ual "
+            f"or evaluate_ual (got --dataset {a.dataset})")
+
+
+def main_ual(a: argparse.Namespace) -> None:
+    require(a.dataset in (None, "ual_bench"),
+            f"'{a.command}' is a UAL-Bench command; --dataset must be ual_bench (got {a.dataset})")
+    if a.command == "selftest_ual":
+        selftest_ual(a.ual_repo or "")
+        return
+    require(a.ual_mode == "query_conditioned", MODE_B_MESSAGE)
+    require(a.method == "crux", "UAL-Bench evaluates CRUX only; GliDe and vanilla are not run on "
+                                "UAL-Bench (explicit guard)")
+    if a.command == "evaluate_ual" and a.ual_predictions:
+        cmd_evaluate_ual_file(a.ual_predictions, a.ual_repo or "")
+        return
+    bb = a.backbone
+    a.backbone = None
+    try:
+        cfg = cfg_from_args(a)
+    finally:
+        a.backbone = bb
+    us = ual_settings_from_args(a)
+    us.work_root = ual_resolve_work_root(us, cfg)
+    setup_logging(ual_paths(us)["logs"], a.command)
+    set_seed(cfg.seed)
+    if a.command == "inspect_ual":
+        cmd_inspect_ual(cfg, us)
+    elif a.command == "run_ual":
+        cmd_run_ual(cfg, us, ual_resolve_backbones(bb), model_override=a.model or "")
+    elif a.command == "evaluate_ual":
+        cmd_evaluate_ual(cfg, us, ual_resolve_backbones(bb, default_all=True))
+
+
+# -----------------------------------------------------------------------------
+# Self-test (no model downloads, no GPU)
+# -----------------------------------------------------------------------------
+
+# Verbatim records of the official paper-version files (see UAL_BENCH_NOTES.md).
+_UAL_FIX_OOPS = {
+    "34 Funny Kid Nominees - FailArmy Hall Of Fame (May 2017)0": {
+        "start_time": 2.714329, "end_time": 3.75,
+        "description": "A guy jumps onto a bed where his son is. When the guy jumps, the son flies "
+                       "up and hits the wall."},
+    "34 Funny Kid Nominees - FailArmy Hall Of Fame (May 2017)10": {
+        "start_time": 3.53317, "end_time": 7.375,
+        "description": "a little boy is running around with cover on head Boy trips over toys and "
+                       "falls."}}
+_UAL_FIX_SSBD = [
+    ["v_ArmFlapping_01", {"id": "b_01", "time": "0018:0024", "bodypart": "hand",
+                          "category": "armflapping", "intensity": "high", "modality": "video",
+                          "description": "a person is armflapping with high intensity"}],
+    ["v_ArmFlapping_01", {"id": "b_02", "time": "0027:0032", "bodypart": "full",
+                          "category": "headbanging", "intensity": "high", "modality": "video",
+                          "description": "a person is headbanging with high intensity"}]]
+_UAL_FIX_FUNQA = [{"instruction": "Identify the video's funny moment.",
+                   "visual_input": "H_A_101_1433_1631.mp4", "output": "[0000,  0195]",
+                   "task": "H1", "ID": "test_0", "start_time": 0.0, "end_time": 6.5}]
+_UAL_FIX_INSTRUCT = [{"video": "25 Best Trampoline Fail Nominees - FailArmy Hall of Fame (July "
+                               "2017)11.mp4",
+                      "QA": [{"q": "Find the start time and end time of the query below from the "
+                                   "video.\n          Query: man attempted to jump from trampoline "
+                                   "into pool man tripped on trampoline and fell onto the ground",
+                              "a": "start_time: 1.689396, end_time: 6.0"}]}]
+# src/eval/output_test_template.json and the output printed in the official README.
+_UAL_TEMPLATE = [
+    {"video_id": "video_01", "start_time": 2.714329, "end_time": 3.75, "pred_start": 1.0, "pred_end": 1.5},
+    {"video_id": "video_02", "start_time": 5.123456, "end_time": 6.789012, "pred_start": 4.0, "pred_end": 5.5},
+    {"video_id": "video_03", "start_time": 1.234567, "end_time": 2.345678, "pred_start": 0.5, "pred_end": 1.0},
+    {"video_id": "video_04", "start_time": 7.890123, "end_time": 9.012345, "pred_start": 6.5, "pred_end": 7.0},
+    {"video_id": "video_05", "start_time": 3.456789, "end_time": 4.567890, "pred_start": 2.0, "pred_end": 3.0},
+    {"video_id": "video_06", "start_time": 8.901234, "end_time": 10.123456, "pred_start": 7.5, "pred_end": 8.0}]
+_UAL_TEMPLATE_README = {"r1_iou_0.3": "0.00", "r1_iou_0.5": "0.00", "r1_iou_0.7": "0.00",
+                        "miou": "0.02", "r1_td_0": "0.00", "r1_td_1": "0.00", "r1_td_3": "33.33",
+                        "r1_td_5": "100.00", "r1_td_7": "100.00", "mtd": "3.07",
+                        "onset_acc_1s": "16.67", "onset_acc_0.25s": "0.00"}
+# Synthetic video lengths: OOPS clips end slightly BEFORE their annotated end_time,
+# as on the real '... (May 2017)0' clip (end_time 3.75 s, mp4 3.64 s).
+_UAL_FIX_SECONDS = {"uag_oops": {"34 Funny Kid Nominees - FailArmy Hall Of Fame (May 2017)0": 3.6,
+                                 "34 Funny Kid Nominees - FailArmy Hall Of Fame (May 2017)10": 7.3},
+                    "uag_ssbd": {"v_ArmFlapping_01": 34.0},
+                    "uag_funqa": {"H_A_101_1433_1631": 6.6}}
+# Frame-exact Mode A output of a perfect presence oracle on the fixtures (4 fps).
+# The 7.3 s clip ends at 7.25 s, not 7.3 s: the sampler's last seek (t = 7.25 s,
+# frame 72.5 of 73) reads nothing, so the last decoded frame is t = 7.0 s and its
+# window ends at 7.0 + 1/fps. Predictions never extend past decoded frames.
+_UAL_FIX_EXPECTED = {"34 Funny Kid Nominees - FailArmy Hall Of Fame (May 2017)0": (2.75, 3.6),
+                     "34 Funny Kid Nominees - FailArmy Hall Of Fame (May 2017)10": (3.75, 7.25),
+                     "v_ArmFlapping_01_b_01": (18.0, 24.0), "v_ArmFlapping_01_b_02": (27.0, 32.0),
+                     "H_A_101_1433_1631.mp4": (0.0, 6.5)}
+
+
+def _ual_build_fixture(root: str) -> None:
+    for s, data in (("uag_oops", _UAL_FIX_OOPS), ("uag_ssbd", _UAL_FIX_SSBD),
+                    ("uag_funqa", _UAL_FIX_FUNQA)):
+        atomic_write_json(os.path.join(root, "data", s, UAL_ANNOTATION_FILES[s]), data)
+        for k, (stem, sec) in enumerate(_UAL_FIX_SECONDS[s].items()):
+            _write_video(os.path.join(root, "data", s, "videos", stem + ".mp4"), sec, seed=11 + k)
+    atomic_write_json(os.path.join(root, "data", "uag_oops_train_instruct",
+                                   "uag_oops_train_instruct_dataset_v1.json"), _UAL_FIX_INSTRUCT)
+
+
+def _ual_mock_oracle(frame_pos: Dict[Tuple[str, str, int], int], win_frames: Dict[str, Tuple],
+                     log: List[Tuple[str, str]]):
+    """A perfect presence oracle for the fixtures: Yes iff a kept frame lies in
+    the queried GT interval. The oracle is the simulated world and knows GT; the
+    method under test only sees its Yes/No log-probs."""
+    def oracle(kind, system, user, images, options):
+        log.append((system, user))
+        require(kind == "score" and system == P_UAL_PRESENCE_SYS, f"unexpected call {system[:40]}")
+        q = user.split("\n", 1)[0][len("Query: "):]
+        img = images[0]
+        if img == "__content_free__":
+            lo = -1.0
+        else:
+            ap = os.path.abspath(img)
+            m = _KEEP_RE.search(ap)
+            d = os.path.dirname(ap)
+            ids = (range(int(m.group(1)), int(m.group(2)) + 1) if m
+                   else win_frames[re.sub(r"_(stitched|pair)\.jpg$", "_stitched.jpg", ap)])
+            lo = 3.0 if any(frame_pos.get((q, d, f), 0) for f in ids) else -3.0
+        return {"yes": lo / 2, "no": -lo / 2}
+    return oracle
+
+
+def _ual_snapshot(root: str) -> Dict[str, Tuple[int, int]]:
+    out = {}
+    for dp, _, fs in os.walk(root):
+        for f in fs:
+            p = os.path.join(dp, f)
+            st = os.stat(p)
+            out[p] = (st.st_size, st.st_mtime_ns)
+    return out
+
+
+def selftest_ual(official_repo: str = "", verbose: bool = True) -> None:
+    import inspect as _inspect
+    import shutil
+    import tempfile
+    fails, n = [], [0]
+
+    def chk(name: str, cond: bool, detail: str = "") -> None:
+        n[0] += 1
+        if not cond:
+            fails.append(f"{name}: {detail}")
+        if verbose:
+            print(f"  [{'ok' if cond else 'FAIL'}] {name}" + (f" -- {detail}" if detail and not cond else ""))
+
+    def raises(name: str, fn: Callable, needle: str) -> None:
+        try:
+            fn()
+        except Exception as e:  # noqa: BLE001 - the message is what is tested
+            chk(name, needle.lower() in str(e).lower(), f"message lacks {needle!r}: {str(e)[:300]}")
+            return
+        chk(name, False, "no exception raised")
+
+    if not LOG.handlers:
+        logging.basicConfig(level=logging.WARNING)
+    _UAL_ECHO[0] = False
+    print("== UAL-Bench: selector, backbones, guards ==")
+    ap = build_parser()
+    a0 = ap.parse_args(["run"])
+    chk("default dataset of legacy commands is VideoGlitchBench",
+        a0.dataset is None and (_legacy_dataset_guard(a0) is None))
+    raises("legacy command with --dataset ual_bench is refused",
+           lambda: _legacy_dataset_guard(ap.parse_args(["run", "--dataset", "ual_bench"])),
+           "VideoGlitchBench command")
+    raises("UAL command with --dataset videoglitchbench is refused",
+           lambda: main_ual(ap.parse_args(["run_ual", "--dataset", "videoglitchbench"])),
+           "UAL-Bench command")
+    c0 = Config()
+    chk("VideoGlitchBench Config and paths are unchanged",
+        c0.work_subdir == "crux_v8_work" and c0.paths()["runs"].endswith(
+            os.path.join("crux_v8_work", "v10", "runs", "qwen2.5-vl-7b"))
+        and c0.seg_penalty == 1.0 and c0.refine_mode == "frame" and VERSION == "10.0")
+    a1 = ap.parse_args(["run_ual", "--ual_dataset", "uag_oops", "--backbone", "qwen2.5-vl-7b"])
+    chk("Mode A (query_conditioned) is the default UAL mode", a1.ual_mode == "query_conditioned")
+    raises("Mode B needs an explicit flag and is refused as not implemented",
+           lambda: main_ual(ap.parse_args(["run_ual", "--ual_dataset", "uag_oops", "--backbone",
+                                           "qwen2.5-vl-7b", "--ual_mode",
+                                           "open_ended_full_pipeline"])), "Mode B")
+    raises("vanilla / GliDe cannot be run on UAL-Bench",
+           lambda: main_ual(ap.parse_args(["run_ual", "--ual_dataset", "uag_oops", "--backbone",
+                                           "qwen2.5-vl-7b", "--method", "vanilla"])), "GliDe")
+    chk("UAL backbones are exactly the three approved checkpoints",
+        {k: v[1] for k, v in UAL_BACKBONES.items()} == {
+            "qwen2.5-vl-7b": "Qwen/Qwen2.5-VL-7B-Instruct",
+            "internvl2.5-8b": "OpenGVLab/InternVL2_5-8B",
+            "ui-tars-1.5-7b": "ByteDance-Seed/UI-TARS-1.5-7B"})
+    chk("UAL backbone ids agree with BACKBONES",
+        all(BACKBONES[k]["hf"] == v[1] for k, v in UAL_BACKBONES.items()))
+    chk("--backbone all expands to the three approved backbones",
+        ual_resolve_backbones("all") == list(UAL_BACKBONES))
+    raises("a non-approved backbone is refused", lambda: ual_resolve_backbones("qwen2.5-vl-3b"),
+           "not part of the UAL-Bench experiment")
+    raises("--model substitution is refused",
+           lambda: ual_backbone_config(Config(), "qwen2.5-vl-7b", UALSettings(),
+                                       "Qwen/Qwen2.5-VL-3B-Instruct"), "never substitutes")
+    raises("hf backend refuses InternVL explicitly (no logits through remote code)",
+           lambda: ual_preflight_backbone(Config(**{**asdict(Config().with_backbone(
+               "internvl2.5-8b")), "backend": "hf"})), "InternVL2.5-8B with vLLM")
+    raises("openai backend without a server fails with a remedy",
+           lambda: ual_preflight_backbone(Config(**{**asdict(Config().with_backbone(
+               "ui-tars-1.5-7b")), "api_base": "http://127.0.0.1:9/v1"})), "vllm serve")
+
+    print("== UAL-Bench: timestamps and official metric port ==")
+    chk("SSBD MMSS: '0105:0125' -> 65 s .. 85 s", ual_parse_ssbd_time("0105:0125", "mmss") == (65.0, 85.0))
+    chk("SSBD MMSS: '0018:0024' -> 18 s .. 24 s", ual_parse_ssbd_time("0018:0024", "mmss") == (18.0, 24.0))
+    chk("SSBD seconds reading is available as a flag",
+        ual_parse_ssbd_time("0105:0125", "seconds") == (105.0, 125.0))
+    raises("SSBD seconds field >= 60 is not MMSS", lambda: ual_parse_ssbd_time("0170:0180", "mmss"),
+           "not MMSS")
+    raises("malformed SSBD time is refused", lambda: ual_parse_ssbd_time("18-24", "mmss"), "dddd:dddd")
+    tm = ual_official_metrics(_UAL_TEMPLATE)
+    chk("port reproduces the official README output on output_test_template.json",
+        ual_format_like_official(tm) == _UAL_TEMPLATE_README,
+        str({k: (v, _UAL_TEMPLATE_README[k]) for k, v in ual_format_like_official(tm).items()
+             if v != _UAL_TEMPLATE_README[k]}))
+    h = ual_official_metrics([{"video_id": "a", "start_time": 2.0, "end_time": 4.0,
+                               "pred_start": 3.0, "pred_end": 5.0},
+                              {"video_id": "b", "start_time": 1.0, "end_time": 6.0,
+                               "pred_start": None, "pred_end": None}])
+    chk("hand case: IoU([2,4],[3,5]) = 1/3, null -> IoU 0 (mIoU 1/6)", abs(h["miou"] - 1 / 6) < 1e-12)
+    chk("hand case: TD is the SUM of boundary errors (2), null -> TD = gt end (6); mTD = 4",
+        abs(h["mtd"] - 4.0) < 1e-12 and h["r1_td_3"] == 50.0 and h["r1_td_5"] == 50.0
+        and h["r1_td_7"] == 100.0, str(h))
+    chk("hand case: recalls are percentages, onset within 1 s counted", h["r1_iou_0.3"] == 50.0
+        and h["onset_acc_1s"] == 50.0 and h["onset_acc_0.25s"] == 0.0, str(h))
+    big = ual_official_metrics([{"video_id": "z", "start_time": 0.0, "end_time": 3.0,
+                                 "pred_start": 0.0, "pred_end": 20000.0}])
+    chk("TD > 10000 enters mTD as gt end (official rule)", big["mtd"] == 3.0 and big["r1_td_7"] == 0.0)
+    raises("string-valued predictions are refused (the official script would crash)",
+           lambda: ual_official_metrics([{"video_id": "s", "start_time": 0.0, "end_time": 1.0,
+                                          "pred_start": "0.0", "pred_end": "1.0"}]), "number")
+    rng = np.random.default_rng(7)
+    xa = rng.random(400)
+    cl = [f"v{i // 2}" for i in range(400)]
+    chk("sign-flip test: identical backbones give p = 1",
+        ual_paired_signflip(xa, xa, cl, 2000, 0)["p"] == 1.0)
+    chk("sign-flip test: a clear effect is detected",
+        ual_paired_signflip(xa + 0.2, xa + rng.normal(0, 0.05, 400), cl, 2000, 0)["p"] < 0.01)
+    lo_, hi_ = ual_cluster_bootstrap_ci(xa, cl, 1000, 0)
+    chk("video-cluster bootstrap CI brackets the mean", lo_ < float(np.mean(xa)) < hi_)
+    chk("GT never enters prompts: the user prompt is the query alone",
+        ual_presence_user("q") == "Query: q\nIs the event described or requested by this query "
+                                  "visibly occurring in this window? Answer with exactly one word: "
+                                  "Yes or No.")
+    sig = set(_inspect.signature(ual_infer_item).parameters)
+    qa, _ = ual_parse_annotations("uag_ssbd", _UAL_FIX_SSBD, "f.json")
+    qf, _ = ual_parse_annotations("uag_funqa", _UAL_FIX_FUNQA, "f.json")
+    chk("model-visible metadata carries no timestamps (SSBD 'time', FunQA 'output')",
+        all("time" not in dict(q.meta) for q in qa) and all("output" not in dict(q.meta) for q in qf))
+    chk("inference functions receive no ground truth (UALQuery has no time fields)",
+        not {f for f in UALQuery.__dataclass_fields__ if "time" in f or "start" in f or "end" in f}
+        and "gt" not in sig and "ds" not in sig, str(sig))
+
+    if cv2 is None:
+        print("== UAL-Bench end-to-end: SKIPPED (opencv missing) ==")
+    else:
+        print("== UAL-Bench: real-schema fixtures, isolation, end-to-end Mode A ==")
+        tmp = tempfile.mkdtemp(prefix="ual_selftest_")
+        root = os.path.join(tmp, "UAL_Bench")
+        _ual_build_fixture(root)
+        vgb = os.path.join(tmp, "VideoGlitchBench")
+        atomic_write_json(os.path.join(vgb, "annotations.json"), [{"video_name": "x.mp4"}])
+        atomic_write_json(os.path.join(vgb, "crux_v8_work", "cache", "qwen2.5-vl-7b", "ab",
+                                       "abc.json"), {"v": 1})
+        atomic_write_json(os.path.join(vgb, "crux_v8_work", "v10", "runs", "qwen2.5-vl-7b",
+                                       "crux_test.json"), {"outputs": []})
+        work = os.path.join(tmp, "crux_v10_ual_work")
+        base = Config(root=vgb, backend="mock", n_bootstrap=300, n_permutations=500)
+
+        def mk(**kw) -> UALSettings:
+            d = dict(subsets=UAL_SUBSETS, root=root, work_root=work)
+            d.update(kw)
+            return UALSettings(**d)
+        for s in UAL_SUBSETS:
+            chk(f"default mapping: {UAL_DISPLAY[s]} -> {UAL_ANNOTATION_FILES[s]}",
+                os.path.basename(ual_find_annotation(mk(), s)) == UAL_ANNOTATION_FILES[s])
+        raises("--ual_annotations = uag_oops_train_instruct_dataset_v1.json is rejected by name",
+               lambda: ual_load_dataset(mk(subsets=("uag_oops",), annotations=os.path.join(
+                   root, "data", "uag_oops_train_instruct",
+                   "uag_oops_train_instruct_dataset_v1.json")), "uag_oops"),
+               "oops_uag_paper_version.json")
+        odd = os.path.join(tmp, "renamed_annotations.json")
+        atomic_write_json(odd, _UAL_FIX_INSTRUCT)
+        raises("instruction-format data under another name is rejected by schema",
+               lambda: ual_load_dataset(mk(subsets=("uag_oops",), annotations=odd), "uag_oops"),
+               "training/instruction-format")
+        raises("another subset's file is refused by schema",
+               lambda: ual_load_dataset(mk(subsets=("uag_oops",), annotations=os.path.join(
+                   root, "data", "uag_ssbd", "ssbd_paper_version.json")), "uag_oops"),
+               "paper-version schema")
+        raises("missing --ual_root is an actionable error, never a VideoGlitchBench fallback",
+               lambda: ual_load_dataset(UALSettings(subsets=("uag_oops",)), "uag_oops"),
+               "--ual_root")
+        raises("missing annotation file names every searched path",
+               lambda: ual_load_dataset(mk(root=os.path.join(tmp, "nowhere")), "uag_ssbd"),
+               "never used as a fallback")
+        raises("UAL work root inside the VideoGlitchBench root is refused",
+               lambda: ual_resolve_work_root(mk(work_root=os.path.join(vgb, "ual")), base),
+               "VideoGlitchBench root")
+        raises("UAL work root inside the UAL-Bench data is refused",
+               lambda: ual_resolve_work_root(mk(work_root=os.path.join(root, "w")), base),
+               "UAL-Bench data root")
+        chk("default UAL work root is a sibling of --ual_root",
+            ual_resolve_work_root(mk(work_root=""), base) == os.path.join(tmp, "crux_v10_ual_work"))
+
+        dss = {s: ual_load_dataset(mk(), s) for s in UAL_SUBSETS}
+        oo, ss, fq = dss["uag_oops"], dss["uag_ssbd"], dss["uag_funqa"]
+        chk("UAG-OOPS fixture parses with official ids, query = description",
+            [q.item_id for q in oo.queries] == list(_UAL_FIX_OOPS)
+            and oo.queries[0].query == _UAL_FIX_OOPS[oo.queries[0].item_id]["description"])
+        chk("UAG-OOPS end_time stored verbatim (duration-valued 3.75 s)",
+            oo.gt["34 Funny Kid Nominees - FailArmy Hall Of Fame (May 2017)0"].end_time == 3.75)
+        chk("UAG-SSBD keeps every behaviour as its own item with the official id",
+            [q.item_id for q in ss.queries] == ["v_ArmFlapping_01_b_01", "v_ArmFlapping_01_b_02"]
+            and len({q.video_file for q in ss.queries}) == 1)
+        chk("UAG-SSBD query follows the official script",
+            [q.query for q in ss.queries] == ["A person is armflapping with high intensity.",
+                                              "A person is headbanging with high intensity."])
+        chk("UAG-SSBD GT from MMSS", (ss.gt["v_ArmFlapping_01_b_02"].start_time,
+                                      ss.gt["v_ArmFlapping_01_b_02"].end_time) == (27.0, 32.0))
+        chk("UAG-FunQA id = visual_input, query = instruction",
+            fq.queries[0].item_id == "H_A_101_1433_1631.mp4"
+            and fq.queries[0].query == "Identify the video's funny moment.")
+        chk("every fixture video resolves", all(all(v for v in d.video_paths.values())
+                                                for d in dss.values()))
+        g2 = json.loads(json.dumps(_UAL_FIX_OOPS))
+        first = next(iter(g2))
+        g2[first]["end_time"] = 99.0
+        q2, _ = ual_parse_annotations("uag_oops", g2, "x.json")
+        chk("cache namespace is GT-free (changing GT leaves the input fingerprint unchanged)",
+            ual_inputs_fingerprint(q2) == oo.inputs_fingerprint
+            and ual_cache_namespace(base, oo, mk()) == ual_cache_namespace(
+                base, UALDataset(**{**oo.__dict__, "annotation_sha256": "other"}), mk()))
+        vg_vlm = MockVLM(base, os.path.join(tmp, "k"), lambda *a_: {})
+        ua_vlm = make_ual_vlm(base, os.path.join(tmp, "k2"), ual_cache_namespace(base, oo, mk()),
+                              lambda *a_: {})
+        ua_vlm2 = make_ual_vlm(base, os.path.join(tmp, "k3"), ual_cache_namespace(base, ss, mk()),
+                               lambda *a_: {})
+        kargs = ("score", P_PRESENCE_SYS, "u", [], {})
+        chk("UAL cache keys cannot collide with VideoGlitchBench or across subsets",
+            len({vg_vlm._key(*kargs), ua_vlm._key(*kargs), ua_vlm2._key(*kargs)}) == 3)
+        chk("UAL caches live under <work>/ual_bench/<subset>/cache/<backbone>",
+            ual_paths(mk(), "uag_oops", "qwen2.5-vl-7b")["cache"] == os.path.join(
+                work, "ual_bench", "uag_oops", "cache", "qwen2.5-vl-7b")
+            and not _ual_within(work, vgb))
+
+        # frame-level presence labels of the simulated world
+        frame_pos: Dict[Tuple[str, str, int], int] = {}
+        win_frames: Dict[str, Tuple] = {}
+        memo: Dict = {}
+        for s, d in dss.items():
+            for q in d.queries:
+                wins, _ = ual_prepare_video(base, mk(), d, q.video_file, memo)
+                g = d.gt[q.item_id]
+                for w in wins:
+                    sp = os.path.abspath(w.stitch_path)
+                    win_frames[sp] = tuple(w.frame_ids)
+                    for fid, ft in zip(w.frame_ids, w.frame_times):
+                        frame_pos[(q.query, os.path.dirname(sp), fid)] = int(
+                            g.start_time <= ft < g.end_time)
+        chk("UAL windows are written under <work>/ual_bench/<subset>/windows",
+            all(os.path.abspath(w.stitch_path).startswith(os.path.join(work, "ual_bench"))
+                for v in memo.values() if not isinstance(v, Exception) for w in v[0]))
+        prompts: List[Tuple[str, str]] = []
+        oracle = _ual_mock_oracle(frame_pos, win_frames, prompts)
+        snap_vgb, snap_data = _ual_snapshot(vgb), _ual_snapshot(root)
+        g_ = globals()
+        saved = (g_["load_records"], g_["load_splits"])
+
+        def _boom(*_a, **_k):
+            raise AssertionError("VideoGlitchBench loader called from a UAL command")
+        g_["load_records"] = g_["load_splits"] = _boom
+        try:
+            md = cmd_run_ual(base, mk(), ["qwen2.5-vl-7b", "ui-tars-1.5-7b"], oracle=oracle)
+            routed = True
+        except AssertionError as e:
+            routed, md = False, ""
+            chk("UAL run never calls the VideoGlitchBench loaders", False, str(e))
+        finally:
+            g_["load_records"], g_["load_splits"] = saved
+        if routed:
+            chk("UAL run never calls the VideoGlitchBench loaders", True)
+            chk("VideoGlitchBench tree is byte-for-byte untouched", _ual_snapshot(vgb) == snap_vgb)
+            chk("UAL-Bench data tree is untouched", _ual_snapshot(root) == snap_data)
+            new = set(_ual_snapshot(tmp)) - set(snap_vgb) - set(snap_data)
+            chk("every file the UAL run wrote is inside the UAL work root",
+                all(_ual_within(p, work) or p.startswith(os.path.join(tmp, "k"))
+                    or p == odd for p in new), str(sorted(p for p in new if not _ual_within(p, work))[:3]))
+            chk("prompts are exactly the UAL presence prompt with the official query",
+                {p[0] for p in prompts} == {P_UAL_PRESENCE_SYS}
+                and {p[1] for p in prompts} <= {ual_presence_user(q.query) for d in dss.values()
+                                                for q in d.queries})
+            gt_txt = {f"{v:g}" for d in dss.values() for g in d.gt.values()
+                      for v in (g.start_time, g.end_time)} | {
+                          str(v) for d in dss.values() for g in d.gt.values()
+                          for v in (g.start_time, g.end_time)}
+            chk("no ground-truth timestamp string appears in any prompt",
+                not any(t in p[0] or t in p[1] for p in prompts for t in gt_txt if len(t) > 1))
+            res = {}
+            for s in UAL_SUBSETS:
+                for k in ("qwen2.5-vl-7b", "ui-tars-1.5-7b"):
+                    rd = ual_paths(mk(), s, k)["run"]
+                    res[(s, k)] = (read_json(os.path.join(rd, "predictions_official.json")),
+                                   read_json(os.path.join(rd, "raw_outputs.json")))
+            preds = {r["video_id"]: r for s in UAL_SUBSETS
+                     for r in res[(s, "qwen2.5-vl-7b")][0]}
+            chk("official prediction schema: exactly video_id/start_time/end_time/pred_start/pred_end",
+                all(set(r) == set(UAL_OFFICIAL_KEYS) for v in res.values() for r in v[0]))
+            chk("Mode A recovers every fixture interval at frame resolution",
+                all(abs(preds[i]["pred_start"] - a_) < 1e-6 and abs(preds[i]["pred_end"] - b_) < 1e-6
+                    for i, (a_, b_) in _UAL_FIX_EXPECTED.items()),
+                str({i: (preds[i]["pred_start"], preds[i]["pred_end"]) for i in _UAL_FIX_EXPECTED}))
+            o0 = preds["34 Funny Kid Nominees - FailArmy Hall Of Fame (May 2017)0"]
+            raw0 = res[("uag_oops", "qwen2.5-vl-7b")][1]["items"][0]
+            chk("UAG-OOPS duration-valued end_time kept verbatim (3.75) while the prediction "
+                "stays inside the decoded video", o0["end_time"] == 3.75
+                and o0["pred_end"] <= raw0["decoded_duration"] + 1e-9 < 3.75)
+            chk("UAG-SSBD behaviours of one video stay distinct items with distinct predictions",
+                preds["v_ArmFlapping_01_b_01"]["pred_start"] != preds["v_ArmFlapping_01_b_02"][
+                    "pred_start"] and len(res[("uag_ssbd", "qwen2.5-vl-7b")][0]) == 2)
+            chk("raw outputs are GT-free",
+                not any(k in r for v in res.values() for r in v[1]["items"]
+                        for k in ("start_time", "end_time")))
+            met = read_json(os.path.join(ual_paths(mk(), "uag_ssbd", "qwen2.5-vl-7b")["run"],
+                                         "metrics.json"))["official_metrics"]
+            chk("perfect oracle on SSBD: R@1,IoU>=0.7 = 100 and mTD = 0",
+                met["r1_iou_0.7"] == 100.0 and met["mtd"] == 0.0, str(met))
+            man = read_json(os.path.join(ual_paths(mk(), "uag_oops", "qwen2.5-vl-7b")["run"],
+                                         "manifest.json"))
+            chk("manifest records model, prompt, rule and data fingerprints",
+                man["model"] == "Qwen/Qwen2.5-VL-7B-Instruct" and man["selection_rule"][
+                    "predeclared"] and man["annotation_sha256"] == oo.annotation_sha256
+                and not man["partial"])
+            with open(md, encoding="utf-8") as f:
+                mdl = f.read().splitlines()
+            chk("summary uses the exact required main-table header", UAL_MAIN_HEADER in mdl)
+            chk("summary has one row per backbone per subset",
+                sum(1 for l_ in mdl if l_.startswith("Qwen2.5-VL-7B-Instruct | ")) >= 3
+                and sum(1 for l_ in mdl if l_.startswith("UI-TARS-1.5-7B | ")) >= 3)
+            js = read_json(os.path.join(os.path.dirname(md), "results.json"))
+            chk("both backbones were evaluated on the same item ids",
+                all(v["same_item_set_for_all_backbones"] for v in js["subsets"].values()))
+            if official_repo:
+                for s in UAL_SUBSETS:
+                    pf = os.path.join(ual_paths(mk(), s, "qwen2.5-vl-7b")["run"],
+                                      "predictions_official.json")
+                    mine = ual_format_like_official(ual_official_metrics(read_json(pf)))
+                    chk(f"port == unmodified official evaluator on the {UAL_DISPLAY[s]} run",
+                        mine == ual_run_official_evaluator(official_repo, pf))
+            # partial runs are labelled and isolated
+            md_p = cmd_run_ual(base, mk(subsets=("uag_ssbd",), limit=1), ["qwen2.5-vl-7b"],
+                               oracle=oracle)
+            rp = os.path.join(ual_paths(mk(limit=1), "uag_ssbd", "qwen2.5-vl-7b")["run"],
+                              "raw_outputs.json")
+            with open(md_p, encoding="utf-8") as f:
+                txt_p = f.read()
+            chk("--limit marks a partial run in paths, outputs and the summary",
+                os.path.exists(rp) and read_json(rp)["partial"] and "partial_limit1" in rp
+                and "PARTIAL RUN" in txt_p)
+            # missing media: actionable failure by default, null predictions on request
+            vf = fq.video_paths["H_A_101_1433_1631.mp4"]
+            shutil.move(vf, vf + ".away")
+            try:
+                raises("a missing video aborts before inference with a remedy",
+                       lambda: cmd_run_ual(base, mk(subsets=("uag_funqa",)), ["qwen2.5-vl-7b"],
+                                           oracle=oracle), "--ual_allow_missing_videos")
+                cmd_run_ual(base, mk(subsets=("uag_funqa",), allow_missing_videos=True,
+                                     work_root=os.path.join(tmp, "w_missing")),
+                            ["qwen2.5-vl-7b"], oracle=oracle)
+                pm = read_json(os.path.join(ual_paths(mk(work_root=os.path.join(tmp, "w_missing")),
+                                                      "uag_funqa", "qwen2.5-vl-7b")["run"],
+                                            "metrics.json"))["official_metrics"]
+                chk("allowed missing videos are scored as official null predictions",
+                    pm["n_null_predictions"] == 1 and pm["miou"] == 0.0 and pm["mtd"] == 6.5, str(pm))
+            finally:
+                shutil.move(vf + ".away", vf)
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    if official_repo:
+        print("== UAL-Bench: parity with the official evaluator script ==")
+        td = tempfile.mkdtemp()
+        tf = os.path.join(td, "template.json")
+        atomic_write_json(tf, _UAL_TEMPLATE)
+        off = ual_run_official_evaluator(official_repo, tf)
+        chk("official script on the template prints the README numbers", off == _UAL_TEMPLATE_README,
+            str(off))
+        rng2 = np.random.default_rng(3)
+        rows = []
+        for i in range(300):
+            gs = float(rng2.uniform(0, 30))
+            ge = gs + float(rng2.uniform(0.1, 10))
+            if i % 17 == 0:
+                rows.append({"video_id": f"r{i}", "start_time": gs, "end_time": ge,
+                             "pred_start": None, "pred_end": None})
+                continue
+            ps = float(rng2.uniform(0, 35))
+            rows.append({"video_id": f"r{i}", "start_time": gs, "end_time": ge, "pred_start": ps,
+                         "pred_end": ps + float(rng2.uniform(0.05, 12))})
+        rf = os.path.join(td, "random.json")
+        atomic_write_json(rf, rows)
+        mine = ual_format_like_official(ual_official_metrics(rows))
+        off = ual_run_official_evaluator(official_repo, rf)
+        chk("port == official script on 300 random items incl. null predictions", mine == off,
+            str({k: (mine[k], off.get(k)) for k in mine if mine[k] != off.get(k)}))
+        shutil.rmtree(td, ignore_errors=True)
+    else:
+        print("== UAL-Bench parity with the official evaluator: SKIPPED (pass --ual_repo) ==")
+
+    _UAL_ECHO[0] = True
+    print(f"\n{n[0] - len(fails)}/{n[0]} UAL-Bench checks passed")
+    if fails:
+        for f in fails:
+            print("  FAIL:", f)
+        raise SystemExit(1)
+
+
+# =============================================================================
 # CLI
 # =============================================================================
 
 COMMANDS = ("selftest", "prepare", "diagnose", "probe", "calibrate", "run", "import_glide",
-            "export", "evaluate", "ablate")
+            "export", "evaluate", "ablate") + UAL_COMMANDS
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -3457,6 +5427,34 @@ def build_parser() -> argparse.ArgumentParser:
         elif isinstance(default, (int, float, str)):
             ap.add_argument(f"--{f.name}", default=None, type=type(default))
     ap.add_argument("--limit", type=int, default=None)
+    # Dataset selector. None means VideoGlitchBench for the legacy commands and
+    # UAL-Bench for the *_ual commands; any other combination is refused.
+    ap.add_argument("--dataset", default=None, choices=("videoglitchbench", "ual_bench"))
+    g = ap.add_argument_group("UAL-Bench (inspect_ual, run_ual, evaluate_ual, selftest_ual)")
+    g.add_argument("--ual_dataset", default=None, choices=UAL_SUBSETS + ("all",))
+    g.add_argument("--ual_root", default=None,
+                   help="UAL_Bench repository clone or dataset folder (annotations + videos)")
+    g.add_argument("--ual_annotations", default=None,
+                   help="paper-version annotation file of the ONE selected subset")
+    g.add_argument("--ual_video_root", default=None)
+    for s_ in UAL_SUBSETS:
+        g.add_argument(f"--ual_{_ual_short(s_)}_annotations", default=None)
+        g.add_argument(f"--ual_{_ual_short(s_)}_videos", default=None)
+    g.add_argument("--ual_work_root", default=None,
+                   help="default: <parent of --ual_root>/crux_v10_ual_work")
+    g.add_argument("--ual_mode", default="query_conditioned", choices=UAL_MODES)
+    g.add_argument("--ual_seg_tau", type=float, default=UAL_PREDECLARED["seg_tau"])
+    g.add_argument("--ual_seg_penalty", type=float, default=UAL_PREDECLARED["seg_penalty"])
+    g.add_argument("--ual_refine_mode", default=UAL_PREDECLARED["refine_mode"],
+                   choices=UAL_REFINE_MODES)
+    g.add_argument("--ual_ssbd_time_format", default="mmss", choices=("mmss", "seconds"))
+    g.add_argument("--ual_allow_missing_videos", action="store_true")
+    g.add_argument("--ual_api_bases", default="",
+                   help="backbone=url,... (one OpenAI-compatible server per backbone)")
+    g.add_argument("--ual_predictions", default=None,
+                   help="evaluate_ual: score any file in the official prediction schema")
+    g.add_argument("--ual_repo", default=None,
+                   help="official UAL_Bench clone: cross-check against its evaluator script")
     return ap
 
 
@@ -3473,6 +5471,10 @@ def cfg_from_args(a: argparse.Namespace) -> Config:
 
 def main() -> None:
     a = build_parser().parse_args()
+    if a.command in UAL_COMMANDS:
+        main_ual(a)     # own logging, paths and caches; never touches VideoGlitchBench
+        return
+    _legacy_dataset_guard(a)
     if a.command == "selftest":
         selftest(a.glide_repo or "")
         return
